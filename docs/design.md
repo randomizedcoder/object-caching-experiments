@@ -72,7 +72,11 @@ hostname, port, and resource size.
    1. [Docker Distribution registry (proxy mode)](#91-docker-distribution-registry-proxy-mode)
    2. [Zot](#92-zot)
    3. [Nginx as an HTTP proxy cache](#93-nginx-as-an-http-proxy-cache)
+   4. [Varnish](#94-varnish)
+   5. [Apache Traffic Server](#95-apache-traffic-server)
+   6. [Considered alternatives we did not pick](#96-considered-alternatives-we-did-not-pick)
 10. [Client-side HAProxy: health checks and consistent hashing](#10-client-side-haproxy-health-checks-and-consistent-hashing)
+    1. [Considered alternatives we did not pick](#101-considered-alternatives-we-did-not-pick)
 11. [Client-side: per-registry transparent mirroring](#11-client-side-per-registry-transparent-mirroring)
     1. [Mode 1 (primary): containerd `hosts.toml` per-registry mirrors](#111-mode-1-primary-containerd-hoststoml-per-registry-mirrors)
         1. [Why this works today](#1111-why-this-works-today)
@@ -93,9 +97,17 @@ hostname, port, and resource size.
     7. [Switching between caches in MITM mode](#127-switching-between-caches-in-mitm-mode)
     8. [Trade-offs vs the `registry-mirrors` mode](#128-trade-offs-vs-the-registry-mirrors-mode)
     9. [Why we keep both modes available](#129-why-we-keep-both-modes-available)
-13. [Build and run workflow](#13-build-and-run-workflow)
-14. [Design choices to validate](#14-design-choices-to-validate)
-15. [Future work](#15-future-work)
+13. [OS package caching (apt / dnf / yum) — Layer 2](#13-os-package-caching-apt--dnf--yum--layer-2)
+    1. [The cache target](#131-the-cache-target)
+    2. [Topology](#132-topology)
+    3. [Network-layer interception (iptables REDIRECT)](#133-network-layer-interception-iptables-redirect)
+    4. [The CA-trust-in-containers problem](#134-the-ca-trust-in-containers-problem)
+    5. [Implementation: the `cache-ca-injector` runc prestart hook](#135-implementation-the-cache-ca-injector-runc-prestart-hook)
+    6. [What this does and doesn't catch](#136-what-this-does-and-doesnt-catch)
+    7. [Trade-offs and risk](#137-trade-offs-and-risk)
+14. [Build and run workflow](#14-build-and-run-workflow)
+15. [Design choices to validate](#15-design-choices-to-validate)
+16. [Future work](#16-future-work)
 
 ---
 
@@ -234,30 +246,45 @@ names and the **absence** of the apiserver HAProxy section (we don't need
 it).
 
 **Cache backend ports — one per `(cache_type, upstream)` pair.** Five
-Tier-1 OCI upstreams (see §11.1.3 for rationale) × three cache
-implementations = 15 OCI backends, plus a wildcard nginx for
-`_default` (§11.1.5) and a non-OCI nginx for Hugging Face:
+Tier-1 OCI upstreams (§11.1.3) × **five** cache implementations
+(Distribution, Zot, nginx, Varnish, Apache Traffic Server — §9) = 25
+OCI backends, plus a wildcard nginx for `_default` (§11.1.5) and a
+non-OCI nginx for Hugging Face:
 
-| port band     | cache type             | upstream                                                             |
-|---------------|------------------------|----------------------------------------------------------------------|
-| `5000`–`5004` | Distribution proxy     | one port per Tier-1 upstream (`docker.io`, `gcr.io`, `ghcr.io`, `quay.io`, `registry.k8s.io`) |
-| `5050`–`5054` | Zot                    | same five Tier-1 upstreams                                           |
-| `8080`–`8084` | nginx (Option-1 §9.3)  | same five Tier-1 upstreams                                           |
-| `8085`        | nginx wildcard         | `_default` — dynamic `proxy_pass https://$arg_ns;` for any other reg |
-| `8090`        | nginx                  | `huggingface.co` — HTTP, not OCI                                     |
+| port band     | cache type                            | upstream                                                             |
+|---------------|---------------------------------------|----------------------------------------------------------------------|
+| `5000`–`5004` | Distribution proxy                    | one port per Tier-1 upstream (`docker.io`, `gcr.io`, `ghcr.io`, `quay.io`, `registry.k8s.io`) |
+| `5050`–`5054` | Zot                                   | same five Tier-1 upstreams                                           |
+| `5100`–`5104` | Varnish (with hitch sidecar for TLS)  | same five Tier-1 upstreams (§9.4)                                    |
+| `5150`–`5154` | Apache Traffic Server                 | same five Tier-1 upstreams (§9.5)                                    |
+| `8080`–`8084` | nginx (Option-1 §9.3)                 | same five Tier-1 upstreams                                           |
+| `8085`        | nginx wildcard                        | `_default` — dynamic `proxy_pass https://$arg_ns;` for any other reg |
+| `8090`        | nginx                                 | `huggingface.co` — HTTP, not OCI                                     |
 
-> A single Zot instance *could* serve multiple upstreams (its
-> `extensions.sync` block supports a list of `registries`), but
-> running per-upstream listeners keeps the port table symmetric across
-> the three cache implementations and gives us per-upstream isolation
-> for measurement. Catch-all-via-Zot is on the §15 future-work list.
+> A single Zot / Varnish / ATS instance *could* serve multiple
+> upstreams via its own multi-backend config, but running
+> per-upstream listeners keeps the port table symmetric across the
+> five cache implementations and gives us per-upstream isolation for
+> measurement. Catch-all-via-{Varnish, ATS, Zot} is on the §16
+> future-work list — the v1 wildcard is nginx-only because the
+> `proxy_pass https://$arg_ns` trick is dead simple to write.
 
-**Client-side HAProxy ports.** One frontend port per cache type
-(`8088` Distribution, `8089` Zot, `8090` nginx), each with ACLs on the
-containerd-added `ns=` query parameter routing to the matching
-per-upstream backend pool, with a fallback to the `nginx-default`
-wildcard backend for anything unrecognised. See §10 for the HAProxy
-config and §11.1 for how the client gets steered toward these ports.
+**Client-side HAProxy ports.** One frontend port per cache type, all
+on each client:
+
+| port  | cache type            |
+|-------|-----------------------|
+| `8088`| Distribution          |
+| `8089`| Zot                   |
+| `8090`| nginx                 |
+| `8091`| Varnish               |
+| `8092`| Apache Traffic Server |
+
+Each frontend has ACLs on the containerd-added `ns=` query parameter
+routing to the matching per-upstream backend pool, with a fallback to
+the `nginx-default` wildcard backend for anything unrecognised. See
+§10 for the HAProxy config and §11.1 for how the client gets steered
+toward these ports.
 
 ---
 
@@ -435,27 +462,30 @@ rec {
   };
 
   # Generated programmatically by lib.mapAttrs in the constants module;
-  # shown enumerated here for clarity. 15 OCI backends + 2 nginx specials.
+  # shown enumerated here for clarity. 5 cache impls × 5 Tier-1 upstreams
+  # = 25 OCI backends + nginx wildcard + nginx HF special = 27 backends.
+  ociCacheImpls = {
+    distribution = { basePort = 5000; healthPath = "/v2/";    };
+    zot          = { basePort = 5050; healthPath = "/v2/";    };
+    varnish      = { basePort = 5100; healthPath = "/v2/";    };  # see §9.4
+    ats          = { basePort = 5150; healthPath = "/v2/";    };  # see §9.5
+    nginx        = { basePort = 8080; healthPath = "/health"; };  # Option-1 §9.3
+  };
+
   cacheBackends =
-    # 5 distribution proxies, one per Tier-1 upstream, ports 5000-5004
-    (lib.mapAttrs' (name: u: lib.nameValuePair "distribution-${name}" {
-       impl = "distribution"; upstream = name;
-       port = 5000 + u.portIndex; healthPath = "/v2/";
-     }) ociUpstreams)
-    # 5 zot instances, ports 5050-5054
-    // (lib.mapAttrs' (name: u: lib.nameValuePair "zot-${name}" {
-         impl = "zot"; upstream = name;
-         port = 5050 + u.portIndex; healthPath = "/v2/";
+    # 25 per-upstream OCI backends: 5 impls × 5 Tier-1 upstreams
+    builtins.foldl' (acc: implName: acc //
+      (lib.mapAttrs' (upName: u: lib.nameValuePair "${implName}-${upName}" {
+         impl = implName; upstream = upName;
+         port = ociCacheImpls.${implName}.basePort + u.portIndex;
+         healthPath = ociCacheImpls.${implName}.healthPath;
        }) ociUpstreams)
-    # 5 nginx vhosts (Option-1 redirect-following per §9.3), ports 8080-8084
-    // (lib.mapAttrs' (name: u: lib.nameValuePair "nginx-${name}" {
-         impl = "nginx"; upstream = name;
-         port = 8080 + u.portIndex; healthPath = "/health";
-       }) ociUpstreams)
+    ) {} (lib.attrNames ociCacheImpls)
     // {
-      # Wildcard catch-all (§11.1.5) — dynamic ns=-based dispatch
-      "nginx-default"     = { impl = "nginx"; upstream = "_default"; port = 8085; healthPath = "/health"; };
-      # Hugging Face (not OCI; HTTP-only)
+      # Wildcard catch-all (§11.1.5) — dynamic ns=-based dispatch.
+      # v1 is nginx-only; Varnish/ATS wildcard equivalents are §16 future work.
+      "nginx-default"     = { impl = "nginx"; upstream = "_default";    port = 8085; healthPath = "/health"; };
+      # Hugging Face (HTTP, not OCI)
       "nginx-huggingface" = { impl = "nginx"; upstream = "huggingface"; port = 8090; healthPath = "/health"; };
     };
 
@@ -467,7 +497,9 @@ rec {
     frontends = {
       distribution = { port = 8088; impl = "distribution"; };
       zot          = { port = 8089; impl = "zot";          };
-      nginx        = { port = 8090; impl = "nginx";        };  # OCI nginx; not the HF one
+      nginx        = { port = 8090; impl = "nginx";        };  # OCI nginx, not HF
+      varnish      = { port = 8091; impl = "varnish";      };
+      ats          = { port = 8092; impl = "ats";          };
     };
     # ns=<value> → backend pool name (one per Tier-1 upstream).
     # Generated by lib.mapAttrs over ociUpstreams.
@@ -569,9 +601,9 @@ the client modules, and uses `vmResources.cache`.
 
 | VM             | NixOS modules                                                       |
 |----------------|---------------------------------------------------------------------|
-| `cache-client0`| `dockerd`, `haproxy` (frontend `:8088` + 7 backends), `regctl`/`crane` for ad-hoc pulls |
+| `cache-client0`| `dockerd` (containerd-snapshotter), `haproxy` (5 frontends `:8088`–`:8092` + 27 backends), `regctl`/`crane` for ad-hoc pulls |
 | `cache-client1`| same as `client0`                                                   |
-| `cache-cache0` | `distribution` ×2 (`:5000` docker, `:5001` gcr), `zot` ×2 (`:5050`, `:5051`), `nginx` ×3 (`:8080`, `:8081`, `:8082`) |
+| `cache-cache0` | 25 OCI cache processes (`distribution` ×5, `zot` ×5, `varnish` ×5, `ats` ×5, `nginx` ×5 — one per Tier-1 upstream) + `nginx` wildcard `:8085` + `nginx` HF `:8090` |
 | `cache-cache1` | same as `cache0` (identical config — they are intentionally interchangeable so consistent hashing makes sense) |
 
 The two clients are also identical to each other. A second client exists
@@ -843,6 +875,166 @@ point of also testing nginx for OCI is:
    when both are tuned for maximum caching. Option 1 above is the fair
    comparison; the naïve config is the cautionary tale.
 
+### 9.4 Varnish
+
+[Varnish](https://varnish-cache.org/) is a purpose-built HTTP cache
+whose configuration language (VCL) is more expressive than nginx's
+directive-based config for the kind of "strip the signed query params,
+key on this exact thing" surgery that CDN-fronted blob caching needs.
+The most useful feature for us is `vcl_hash` — we control exactly
+what goes into the cache lookup key, so signed-URL drift simply can
+**not** cause a miss.
+
+Per-Tier-1-upstream instance (sketch for the `docker.io` instance
+listening on `:5100`):
+
+```vcl
+vcl 4.1;
+
+import std;
+
+backend upstream {
+    .host = "registry-1.docker.io";
+    .port = "443";
+    .ssl = 1;
+    .probe = {
+        .url = "/v2/";
+        .interval = 5s;
+        .timeout = 2s;
+        .window = 3;
+        .threshold = 2;
+        .expected_response = 401;  # OCI registries answer 401 unauth on /v2/
+    };
+}
+
+sub vcl_recv {
+    # Strip ns= from cache key derivation but keep it for upstream routing.
+    # The digest in $url already uniquely identifies the blob.
+    if (req.url ~ "\?ns=") {
+        set req.http.X-Original-NS = regsub(req.url, "^.*\?ns=([^&]+).*$", "\1");
+        set req.url = regsub(req.url, "\?ns=[^&]+&?", "?");
+        set req.url = regsub(req.url, "\?$", "");
+    }
+    return (hash);
+}
+
+sub vcl_hash {
+    # Hash on URL only. Signed query params on upstream redirects are
+    # not part of the request that reaches us, so this is sufficient.
+    hash_data(req.url);
+    return (lookup);
+}
+
+sub vcl_backend_response {
+    # CDN responses have short TTLs; override for blob digests (immutable)
+    if (bereq.url ~ "/blobs/sha256:") {
+        set beresp.ttl = 30d;
+        set beresp.grace = 7d;
+    } else {
+        set beresp.ttl = 5m;
+    }
+}
+
+sub vcl_deliver {
+    set resp.http.X-Cache = obj.hits > 0 ? "HIT" : "MISS";
+    set resp.http.X-Cache-Hits = obj.hits;
+}
+```
+
+Notes:
+
+- **TLS.** Varnish is HTTP-only on its listen side; on the upstream
+  side it speaks both HTTP and HTTPS. For our case the listener is
+  HTTP (`:5100` on the experiment subnet), so no `hitch` sidecar is
+  needed.
+- **CDN redirects.** Varnish follows them automatically when
+  `backend.host` answers with `301/302/307/308`. Same caching
+  semantics as Distribution / Zot — blob bytes stored by digest.
+- **Storage.** `malloc,4G` for memory-only (fastest) or
+  `file,/var/lib/cache/varnish/docker,40G` for disk-backed
+  persistence across restarts. We use the file backend so cache
+  survives `cache-vm-restart`.
+- **Cache hit logging.** `X-Cache: HIT|MISS` headers feed straight
+  into the per-pull metrics future-work (§16).
+
+### 9.5 Apache Traffic Server
+
+[Apache Traffic Server](https://trafficserver.apache.org/) (ATS) is a
+caching HTTP proxy designed for CDN-scale workloads — it actually
+*runs* large CDNs (Yahoo, Apple, Comcast historically). It has
+first-class support for **parent-child cache hierarchies** that map
+naturally to our two-cache-VM topology: `cache1` can be configured to
+treat `cache0` as its parent, so a miss on `cache1` consults `cache0`
+before going to the real upstream. That's a stronger consistency
+property than HAProxy's consistent hashing alone, which is purely
+client-side.
+
+Per-Tier-1-upstream instance (sketch for the `docker.io` instance
+listening on `:5150`):
+
+```
+# records.config — global tuning
+CONFIG proxy.config.http.server_ports STRING 5150
+CONFIG proxy.config.cache.ram_cache.size INT 268435456              # 256MB RAM cache
+CONFIG proxy.config.http.cache.required_headers INT 0               # cache responses without Cache-Control
+CONFIG proxy.config.http.cache.heuristic_min_lifetime INT 2592000   # 30d
+CONFIG proxy.config.http.cache.heuristic_max_lifetime INT 7776000   # 90d
+CONFIG proxy.config.http.parent_proxy.retry_time INT 30
+CONFIG proxy.config.http.parent_proxy.fail_threshold INT 3
+```
+
+```
+# remap.config — per-upstream rewrite
+map http://_/v2/ https://registry-1.docker.io/v2/  \
+    @plugin=cachekey.so @pparam=--include-params=ns
+```
+
+```
+# parent.config — cache0 ↔ cache1 hierarchy (on cache1, inverted on cache0)
+dest_domain=registry-1.docker.io parent="10.44.44.20:5150" round_robin=consistent_hash go_direct=true
+```
+
+Notes:
+
+- **Why parent-child matters.** With HAProxy consistent hashing, a
+  blob is owned by one cache. If that cache is wiped (`cache-vm-wipe
+  --node=cache0`) the next pull is a miss. With ATS parent-child,
+  `cache1` would consult its sibling `cache0` first before going
+  upstream, so the wipe is cheaper. We can measure this advantage.
+- **Cache-key plugin (`cachekey.so`).** Bundled with ATS. We use it
+  to **include only the meaningful query params** (`ns=`) in the
+  cache key, mirroring the Varnish / nginx Option-1 normalisation.
+- **`go_direct=true`** means "if all parents fail, fall back to the
+  real upstream directly" — same graceful degradation as containerd's
+  hosts.toml fallthrough.
+- **TLS termination** is native to ATS (`ssl_multicert.config`); no
+  sidecar required.
+
+### 9.6 Considered alternatives we did not pick
+
+For completeness, here's why we didn't pick other plausible
+candidates. Most can be added later if a specific characteristic
+turns out to matter:
+
+| Tool | Why we didn't include it in v1 |
+|------|--------------------------------|
+| **Squid** | Excellent at HTTPS forward-proxying with SSL bumping (and we'll use it that way in §12 future work). Not as strong as Varnish/ATS for content caching with custom keying — its cache-key control is config-flag-driven, not programmable. |
+| **Caddy** | Caching is plugin-only (`souin`), less mature than Varnish/ATS. Cleaner config than nginx, but doesn't bring a unique capability to the comparison. |
+| **HAProxy as cache** | HAProxy is a load balancer; it has no native HTTP cache. It would just be "another way to spell nginx" with worse caching semantics. |
+| **Cloudflare Pingora** | Modern Rust, fast, but no off-the-shelf "deploy and configure" surface — you write a Pingora-based proxy as Rust code. Out of scope for an experiment harness. |
+| **Polipo / Privoxy / Tinyproxy** | Either unmaintained or scoped to privacy/filtering rather than caching. |
+
+The five we picked (Distribution, Zot, Varnish, ATS, nginx) give us:
+
+- Two **OCI-protocol-native** caches (Distribution, Zot) — the
+  baseline for "the right tool for the job".
+- Three **generic HTTP caches** (Varnish, ATS, nginx) tuned to handle
+  OCI semantics — answers the question "if you had to use a generic
+  cache, which one is least bad?".
+- All five exercise the same HAProxy + consistent-hashing front-end
+  and the same containerd `hosts.toml` client config, so the only
+  variable across runs is the cache implementation itself.
+
 ---
 
 ## 10. Client-side HAProxy: health checks and consistent hashing
@@ -965,6 +1157,36 @@ Why these knobs (citing the moby analysis):
 `nix/modules/haproxy-client.nix` generates this config from
 `constants.cacheBackends` + `constants.haproxy.routes` with `lib.mapAttrs`
 so adding a new cache type is "add an entry in `constants.nix`, rebuild".
+
+### 10.1 Considered alternatives we did not pick
+
+HAProxy is the client-side L7 router/load-balancer of record for this
+lab. We deliberately did not pick the alternatives below — the table
+captures *why*, so a future contributor can revisit if any of the
+"why not" assumptions stop holding.
+
+| Tool | Native consistent hash | Native active health checks | Native HTTP cache | Why not for v1 |
+|------|------------------------|-----------------------------|-------------------|----------------|
+| **Varnish** | yes (`shard director`, Rendezvous/CARP) | yes (`probes`) | **yes** | The biggest temptation — Varnish adds a *second* tier of cache on each client, which would materially raise hit rate on hot blobs. But it conflates the LB and cache layers, which we explicitly want separate so that "cache implementation under test" is a single variable. We keep Varnish as a *cache-VM* backend (§9.4) where the comparison is fair. Future work in §16 to add a "Varnish-as-client-LB" mode for the two-tier measurement. |
+| **Envoy** | yes (`ring_hash` / `maglev`) | yes | limited (HTTP cache filter is experimental) | Heavier resource footprint and steeper config than we need for two upstream cache VMs. Maglev hashing is theoretically nicer than HAProxy's sdbm-consistent under churn, but with only two backends the difference is negligible. |
+| **Traefik** | partial (hash by source IP; URI hashing requires plugin) | yes | yes (plugin) | The URI-based consistent hashing story is the weakest of any candidate here, which is the exact thing we depend on. |
+| **Nginx as LB** | yes (`hash $uri consistent;`) | mainline is passive-only; active health needs `nginx-plus` ($) or the `nginx_upstream_check_module` patch | yes (`proxy_cache`) | Active health checking is the dealbreaker: we want fast failover from a stalled cache, and HAProxy gives us `inter 2s fall 3 rise 2` out of the box. Patching nginx to get the same behaviour is operationally ugly. |
+| **Apache Traffic Server (parent_proxy)** | yes (`parent_proxy consistent_hash`) | yes | yes | Same conflation concern as Varnish — would mix LB and cache. We keep ATS as a *cache-VM* backend (§9.5) for the same reason. |
+| **Cloudflare Pingora** | yes | yes | yes | No off-the-shelf binary; you write a Pingora-based proxy in Rust. Out of scope for an experiment harness. |
+
+The decision criteria, in priority order, were:
+
+1. **URI-based consistent hashing** is non-negotiable (CDN-served
+   blob caching only works if the same digest lands on the same
+   backend).
+2. **Active health checks with fast failover** are non-negotiable
+   (a stalled cache must not block the next pull).
+3. **No native caching** is *positively desirable* on this layer —
+   we want the cache layer to be a single, swappable variable.
+4. **Single static binary, declarative config** so the Nix module
+   that generates it is trivial.
+
+HAProxy is the only candidate that's a clean win on all four.
 
 ---
 
@@ -1575,7 +1797,236 @@ measurements.
 
 ---
 
-## 13. Build and run workflow
+## 13. OS package caching (apt / dnf / yum) — Layer 2
+
+Everything in §9–§12 caches the **container image** (Layer 1). But a
+container image is just the starting point; what often dominates build
+time and bandwidth is the OS package operations *inside* the container:
+
+```dockerfile
+FROM debian:bookworm
+RUN apt-get update && apt-get install -y build-essential cmake ninja-build  # ~200 MB
+```
+
+```dockerfile
+FROM redhat/ubi9
+RUN dnf install -y gcc make python3-pip                                      # ~300 MB
+```
+
+Every layer cache miss re-downloads those packages from
+`http://deb.debian.org/`, `https://cdn.redhat.com/`, etc. This section
+adds a **Layer 2** cache for those downloads, again transparently
+(unmodified Dockerfile constraint from §11 still applies).
+
+### 13.1 The cache target
+
+| Distro family | Default protocol | Default repos                                                                 | Cacheable surface     |
+|---------------|------------------|------------------------------------------------------------------------------|------------------------|
+| Debian / Ubuntu | HTTP            | `deb.debian.org`, `security.debian.org`, `archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com` | `.deb`, `Packages.gz`, `InRelease`, `Sources.gz` |
+| Alpine        | HTTPS            | `dl-cdn.alpinelinux.org`                                                     | `.apk`, `APKINDEX.tar.gz` |
+| RHEL / UBI / Fedora | HTTPS      | `cdn.redhat.com`, `cdn-ubi.redhat.com`, `mirrors.fedoraproject.org`, `download.fedoraproject.org` | `.rpm`, `repomd.xml`, `*.xml.gz`/`*.xml.zst` |
+| Misc dev      | HTTPS            | `download.docker.com`, `apt.releases.hashicorp.com`, `nodesource.com`, `pypi.org`, `files.pythonhosted.org` (pip wheels) | varies              |
+
+**The HTTP/HTTPS split is the key design constraint.** Debian/Ubuntu
+default to HTTP because Debian packages are individually GPG-signed
+(the cache cannot tamper undetected). Alpine / RHEL / most "third
+party" repos default to HTTPS, where TLS is the integrity story.
+
+This means **OS package caching needs both an HTTP path (easy) and an
+HTTPS path (requires MITM)**. The HTTPS path forces the CA-injection
+question, addressed in §13.4.
+
+### 13.2 Topology
+
+The OS-package cache lives on **the same cache VMs** that host the
+container-image caches (`cache0`, `cache1`). Reusing the cache VMs
+keeps the disk hot-set in one place and lets HAProxy's consistent
+hashing apply uniformly. Two new processes per cache VM:
+
+| port  | service                                  | role                                                           |
+|-------|------------------------------------------|----------------------------------------------------------------|
+| `3142`| **apt-cacher-ng**                        | Distro-aware caching proxy for `.deb` / `.rpm` / `Packages*` / `repomd*` (handles per-mirror, per-distro idiosyncrasies natively) |
+| `8086`| **nginx — generic HTTP/S cache for everything else** | Catch-all for any other HTTP(S) traffic from containers: pip wheels, `download.docker.com`, etc. Same Option-1 redirect-following config as §9.3, but cache key includes `Host:`. |
+
+On the client VMs we add an iptables REDIRECT rule that intercepts
+outbound HTTP(S) traffic from container network namespaces and
+redirects to a local HAProxy frontend (which then forwards to the
+cache VMs with consistent hashing on URI). New HAProxy frontend ports
+on each client:
+
+| port  | role                                                                             |
+|-------|----------------------------------------------------------------------------------|
+| `3142`| Transparent proxy for HTTP/3142-style apt traffic — forwards to apt-cacher-ng on cache VMs |
+| `8080`| Transparent HTTP proxy — forwards generic HTTP to nginx generic on cache VMs     |
+| `8443`| **MITM** TLS proxy — terminates TLS using minted certs from §12, forwards decrypted HTTP to nginx generic |
+
+### 13.3 Network-layer interception (iptables REDIRECT)
+
+Each client VM has an nftables rule chain that watches outbound
+traffic *originating in container namespaces* (uid match, since
+dockerd by default doesn't change uid; or cgroup match for the
+`docker.slice` cgroup):
+
+```bash
+# nix/modules/docker-client.nix → networking.firewall.extraCommands
+nft add table inet pkg-intercept
+nft add chain inet pkg-intercept output { type nat hook output priority dstnat \; }
+
+# Container traffic only — match on cgroup membership of dockerd's slice.
+# Uses nftables's cgroupv2 path matching (kernel ≥ 5.4).
+nft add rule inet pkg-intercept output \
+    socket cgroupv2 level 2 "system.slice/docker.service" \
+    tcp dport 80 redirect to :8080
+
+nft add rule inet pkg-intercept output \
+    socket cgroupv2 level 2 "system.slice/docker.service" \
+    tcp dport 443 redirect to :8443
+```
+
+Two carve-outs we add as explicit rules above these:
+
+- **Container-image traffic** (to ports `8088`–`8092` on the loopback)
+  is *not* intercepted — those are our own mirror endpoints from §11.
+  The `accept` rule for `daddr 127.0.0.0/8` precedes the redirect.
+- **Egress to our own bridge gateway** (`10.44.44.1`) is not
+  intercepted either, so HAProxy's outbound calls to the cache VMs
+  don't loop back.
+
+The HTTP rule (`:8080`) is straightforward — HAProxy proxies the
+plain HTTP request to the cache VMs, hashes on URI for consistency,
+nginx-generic caches by `Host: + $uri`. **apt repos that use HTTP just
+work** with no further surgery.
+
+The HTTPS rule (`:8443`) is where the MITM machinery from §12 has to
+extend down into the container's view of the world — addressed in
+§13.4.
+
+### 13.4 The CA-trust-in-containers problem
+
+Containers don't share the host's `/etc/ssl/certs/`. A `debian:bookworm`
+container has its own `ca-certificates` package and its own trust
+bundle at `/etc/ssl/certs/ca-certificates.crt`. For HTTPS MITM to
+work, **our internal CA (from §12.3) must appear in the trust bundle
+of every container at runtime**, without modifying any Dockerfile.
+
+Three approaches we considered:
+
+| Approach | How it works | Verdict |
+|----------|--------------|---------|
+| Ask users to add the CA to their Dockerfile | `COPY ca.crt /usr/local/share/ca-certificates/ && update-ca-certificates` | ❌ **violates the §11 constraint** |
+| BuildKit `--build-context` injection | Inject a synthetic build context with the CA into every `docker build` | ⚠️ works for builds, *not for* `docker run` of pre-built images. Partial coverage. |
+| **OCI runtime prestart hook** | Custom `runc` wrapper that bind-mounts the CA into every container at the default trust paths | ✅ **chosen approach.** Truly transparent; covers `docker build` and `docker run` equally. |
+
+### 13.5 Implementation: the `cache-ca-injector` runc prestart hook
+
+The hook is a tiny binary (Go, ~100 LOC) installed at
+`/usr/local/bin/cache-ca-injector` on each client VM. We register it
+as the default OCI runtime via `daemon.json`:
+
+```json
+{
+  "default-runtime": "runc-with-ca",
+  "runtimes": {
+    "runc-with-ca": {
+      "path": "/usr/local/bin/runc-with-ca-wrapper"
+    }
+  }
+}
+```
+
+`runc-with-ca-wrapper` is a shell that prepends our prestart hook to
+the OCI spec's `hooks.prestart` array, then `exec`s real `runc`:
+
+```bash
+#!/bin/sh
+# Wraps runc, injecting our CA prestart hook before exec.
+# Reads the OCI bundle spec, adds the hook, writes it back.
+set -e
+BUNDLE=$(awk '{for(i=1;i<=NF;i++) if($i=="--bundle") print $(i+1)}' <<< "$*")
+if [ -f "$BUNDLE/config.json" ]; then
+    jq '.hooks.prestart = ((.hooks.prestart // []) +
+        [{"path": "/usr/local/bin/cache-ca-injector"}])' \
+        "$BUNDLE/config.json" > "$BUNDLE/config.json.tmp" \
+        && mv "$BUNDLE/config.json.tmp" "$BUNDLE/config.json"
+fi
+exec /usr/bin/runc "$@"
+```
+
+The prestart hook itself (`cache-ca-injector.go`) reads the container
+PID from stdin (per the OCI hook protocol), enters its mount
+namespace, and writes the CA into every known trust-bundle location:
+
+```go
+// Pseudocode — actual implementation in nix/modules/ca-injector.nix
+hookState := struct{ Pid int }{}
+json.NewDecoder(os.Stdin).Decode(&hookState)
+
+paths := []string{
+    "/etc/ssl/certs/ca-certificates.crt",         // Debian/Ubuntu/Alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",           // RHEL/Fedora/UBI
+    "/etc/pki/ca-trust/source/anchors/cache.crt", // RHEL update-ca-trust
+    "/etc/ssl/cert.pem",                          // Alpine (libressl)
+}
+
+unix.Setns(...mntNsOf(hookState.Pid)...)
+for _, p := range paths {
+    if _, err := os.Stat(filepath.Dir(p)); err == nil {
+        appendCAToFile(p, "/etc/cache-experiment/ca/root-ca.crt")
+    }
+}
+```
+
+Each path gets the CA *appended* to the existing trust bundle, so the
+container's own CA set still works (containers can still verify real
+upstream TLS — important for the HAProxy fallback path on cache miss).
+
+### 13.6 What this does and doesn't catch
+
+| Workload                                          | Caught by              | Notes |
+|---------------------------------------------------|------------------------|-------|
+| `apt-get install foo` in a Debian/Ubuntu container | apt-cacher-ng (HTTP)   | The common case. Pure HTTP, no MITM needed. |
+| `dnf install foo` in a RHEL/UBI container          | apt-cacher-ng (HTTPS via MITM) | apt-cacher-ng's `rpm-cache` mode also handles RPM. CA injection required. |
+| `apk add foo` in an Alpine container               | nginx generic (HTTPS via MITM) | CA injection required. |
+| `pip install foo` (wheels)                         | nginx generic (HTTPS via MITM) | Wheel files are content-addressed; cache hit rate is high. |
+| `curl https://download.docker.com/...`             | nginx generic (HTTPS via MITM) | Anything else that's just an HTTPS GET. |
+| **Application-level mTLS** (e.g. `gcloud auth`)    | **NOT** caught         | If the app pins certificates or uses mTLS with a client cert, the MITM fails. The container falls back to direct upstream (works, but doesn't cache). |
+| **DoH / DoT in the container**                     | **NOT** caught         | Encrypted DNS bypasses our cache hostname routing. Cache miss → direct upstream. |
+| **Privileged containers** that override the trust bundle from `/proc/self/exe` paths | partial | Custom apps that re-init their own TLS configs may bypass the appended CA. |
+
+### 13.7 Trade-offs and risk
+
+This is the most invasive single change in the design. Specifically:
+
+- **Every container started on our lab clients has a CA from our PKI
+  in its trust bundle.** A container that exfiltrates the trust
+  bundle (e.g. malware in a base image) would see our CA. The blast
+  radius is bounded to "things signed by our CA can MITM that
+  container's later HTTPS calls" — which is exactly what we're doing
+  on purpose, but worth understanding.
+- **Trust bundle mutation breaks reproducibility checks.** Some tools
+  hash the trust bundle (e.g. `update-ca-certificates --verbose`
+  output); they'll see drift. Document; don't fix.
+- **Cache misroute risk is higher than for OCI caches.** With OCI,
+  the `ns=` param lets HAProxy route to the correct upstream-aware
+  cache. With generic HTTP, the cache key includes `Host:` — if two
+  upstreams happen to use the same path under different hostnames,
+  they don't collide (good), but a misconfigured cache that ignored
+  `Host:` would silently cross-contaminate (bad). The nginx-generic
+  config explicitly keys on `$http_host:$request_method:$uri` to
+  avoid this.
+- **The runc wrapper is invasive.** Every container start now goes
+  through our shell + jq + runc instead of just runc. Latency cost is
+  ~10ms per container start; acceptable for an experiment lab,
+  arguably not for a production node.
+
+The §15 design-choices section adds explicit validation items for
+this design (CA presence in started containers, no breakage of
+container TLS to external destinations the cache doesn't intercept,
+nftables rule correctness under restart).
+
+---
+
+## 14. Build and run workflow
 
 Mirrors the apps exposed by `nix-k8s-examples`/`ceph-on-k8s`:
 
@@ -1638,7 +2089,7 @@ Additional helpers we will add:
 
 ---
 
-## 14. Design choices to validate
+## 15. Design choices to validate
 
 A few decisions in this doc are reasonable defaults but worth poking at
 before implementing:
@@ -1774,7 +2225,7 @@ before implementing:
 
 ---
 
-## 15. Future work
+## 16. Future work
 
 - **Workload generator.** A reproducible pull corpus (top-50 docker.io
   images, a fixed set of gcr.io k8s images, a couple of HF models) so we
