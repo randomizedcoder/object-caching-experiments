@@ -33,6 +33,11 @@ hostname, port, and resource size.
   **`gcr.io`**.
 - One additional HTTP upstream is in scope for the nginx cache only:
   **`huggingface.co`** model mirrors.
+- **Maximum caching is an explicit goal.** Every design choice below
+  optimises for "second pull of the same blob/object never reaches
+  upstream", including the design of the cache key and how each cache
+  handles Docker Hub's new CloudFront/Cloudflare CDN architecture
+  (see §6).
 - The harness is for **local experimentation** on a single Linux host. It
   is not a production deployment.
 
@@ -57,19 +62,33 @@ hostname, port, and resource size.
 3. [Overview](#3-overview)
 4. [Repository Layout](#4-repository-layout)
 5. [Network Topology](#5-network-topology)
-6. [Constants Module (`nix/constants.nix`)](#6-constants-module-nixconstantsnix)
-7. [MicroVM Definitions](#7-microvm-definitions)
-8. [Cache Services on the Cache MicroVMs](#8-cache-services-on-the-cache-microvms)
-   1. [Docker Distribution registry (proxy mode)](#81-docker-distribution-registry-proxy-mode)
-   2. [Zot](#82-zot)
-   3. [Nginx as an HTTP proxy cache](#83-nginx-as-an-http-proxy-cache)
-9. [Client-side HAProxy: health checks and consistent hashing](#9-client-side-haproxy-health-checks-and-consistent-hashing)
-10. [Client-side Docker daemon configuration](#10-client-side-docker-daemon-configuration)
-    1. [`registry-mirrors` vs `insecure-registries`](#101-registry-mirrors-vs-insecure-registries)
-    2. [Switching the cache under test](#102-switching-the-cache-under-test)
-11. [Build and run workflow](#11-build-and-run-workflow)
-12. [Design choices to validate](#12-design-choices-to-validate)
-13. [Future work](#13-future-work)
+6. [Docker Hub's CDN architecture (and what it means for caching)](#6-docker-hubs-cdn-architecture-and-what-it-means-for-caching)
+   1. [The blob-fetch flow](#61-the-blob-fetch-flow)
+   2. [Why this matters for caching](#62-why-this-matters-for-caching)
+   3. [Egress allowlist on the experiment subnet](#63-egress-allowlist-on-the-experiment-subnet)
+7. [Constants Module (`nix/constants.nix`)](#7-constants-module-nixconstantsnix)
+8. [MicroVM Definitions](#8-microvm-definitions)
+9. [Cache Services on the Cache MicroVMs](#9-cache-services-on-the-cache-microvms)
+   1. [Docker Distribution registry (proxy mode)](#91-docker-distribution-registry-proxy-mode)
+   2. [Zot](#92-zot)
+   3. [Nginx as an HTTP proxy cache](#93-nginx-as-an-http-proxy-cache)
+10. [Client-side HAProxy: health checks and consistent hashing](#10-client-side-haproxy-health-checks-and-consistent-hashing)
+11. [Client-side Docker daemon configuration](#11-client-side-docker-daemon-configuration)
+    1. [`registry-mirrors` vs `insecure-registries`](#111-registry-mirrors-vs-insecure-registries)
+    2. [Switching the cache under test](#112-switching-the-cache-under-test)
+12. [Alternative: transparent HTTPS MITM via HAProxy (full-control mode)](#12-alternative-transparent-https-mitm-via-haproxy-full-control-mode)
+    1. [Why a vanilla HTTPS_PROXY doesn't help](#121-why-a-vanilla-https_proxy-doesnt-help)
+    2. [The MITM solution: own the CA, mint certs, terminate TLS at HAProxy](#122-the-mitm-solution-own-the-ca-mint-certs-terminate-tls-at-haproxy)
+    3. [PKI design](#123-pki-design)
+    4. [Trust insertion on the client VMs](#124-trust-insertion-on-the-client-vms)
+    5. [DNS poisoning (just `/etc/hosts` for v1)](#125-dns-poisoning-just-etchosts-for-v1)
+    6. [HAProxy frontend with SNI termination](#126-haproxy-frontend-with-sni-termination)
+    7. [Switching between caches in MITM mode](#127-switching-between-caches-in-mitm-mode)
+    8. [Trade-offs vs the `registry-mirrors` mode](#128-trade-offs-vs-the-registry-mirrors-mode)
+    9. [Why we keep both modes available](#129-why-we-keep-both-modes-available)
+13. [Build and run workflow](#13-build-and-run-workflow)
+14. [Design choices to validate](#14-design-choices-to-validate)
+15. [Future work](#15-future-work)
 
 ---
 
@@ -231,7 +250,108 @@ the correct upstream backend pool. See §9.
 
 ---
 
-## 6. Constants Module (`nix/constants.nix`)
+## 6. Docker Hub's CDN architecture (and what it means for caching)
+
+In May 2026 Docker Hub split blob distribution off the registry API host
+and started serving the actual blob bytes from a set of CDN endpoints.
+References:
+[Docker Hub release notes (2026-05-20)](https://docs.docker.com/docker-hub/release-notes/),
+[Docker Desktop allowlist](https://docs.docker.com/desktop/setup/allow-list/).
+
+A Docker Hub pull now talks to **three** classes of host:
+
+| Class    | Hostname(s)                                                                                                                                                                                                                  | Role                                                                                                                                       |
+|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
+| API      | `registry-1.docker.io`                                                                                                                                                                                                       | OCI Distribution v2 endpoint: `GET /v2/`, manifest GETs, initial blob GET that returns the redirect                                        |
+| Auth     | `auth.docker.io`, `auth.docker.com`, `login.docker.com`, `cdn.auth0.com`                                                                                                                                                     | Bearer-token minting in response to a `401 + WWW-Authenticate: Bearer realm=...` challenge from the API host                              |
+| Blob CDN | `production.cloudfront.docker.com` (AWS CloudFront) <br> `production.cloudflare.docker.com` (Cloudflare) <br> `docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com` (Cloudflare R2 — anonymous tier) | The actual blob bytes, served from a CDN edge close to the client. Which of the three you land on depends on plan tier and edge geography. |
+
+### 6.1 The blob-fetch flow
+
+A blob pull is **two HTTP round trips**, not one:
+
+```
+client ──► registry-1.docker.io
+           GET /v2/library/nginx/blobs/sha256:abc123…
+client ◄── 307 Temporary Redirect
+           Location: https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/ab/abc123…/data
+                     ?Expires=…&Signature=…&X-Amz-Algorithm=…
+
+client ──► production.cloudfront.docker.com
+           GET /…/abc123…/data?Expires=…&Signature=…
+client ◄── 200 OK, <blob bytes>
+```
+
+The `Location:` URL is a **short-lived signed URL** with query
+parameters (`Expires`, `Signature`, `X-Amz-Algorithm`, …). The
+signature ties the URL to one blob digest with an expiry on the order
+of minutes.
+
+### 6.2 Why this matters for caching
+
+The signed URL is a transport detail — the **content identity is still
+the sha256 digest in the original `/v2/…/blobs/sha256:<digest>` path**.
+The question for each of our three caches is:
+
+> When upstream returns the 307, **who follows the redirect**, and what
+> **cache key** is the blob stored under?
+
+There are three possible answers, with very different consequences:
+
+| Behaviour                                                                                  | Where blob bytes flow                                                                                  | Cache hit on second pull?                                          |
+|--------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
+| **A.** Cache follows redirect server-side, stores by sha256                                | client → cache → upstream API (→ 307) → cache fetches from CDN → cache stores → client                 | ✅ second pull served entirely by cache, no upstream traffic       |
+| **B.** Cache forwards redirect to client                                                   | client → cache → ← 307 ← cache; client → CDN → client                                                  | ❌ blob bytes never touched the cache; every pull hits upstream CDN |
+| **C.** Cache configured directly against the CDN host, normalises signed query params away | client → cache → CDN → client                                                                          | ✅ but requires careful cache-key normalisation, signature drift is a footgun |
+
+**Behaviour A** is what every OCI-aware proxy does (Distribution proxy
+mode, Zot sync mode): they speak the OCI Distribution protocol, issue
+`/v2/…` requests themselves, follow upstream redirects with their HTTP
+client, and store the result keyed by digest. The CDN change is
+transparent to them — this is the maximum-caching baseline.
+
+**Behaviour B** is what a *naïve* generic HTTP reverse proxy (raw nginx
+`proxy_pass`) does. Without extra config, nginx forwards the 307 to the
+client unchanged. nginx then sees no blob bytes to cache; on every
+subsequent pull the client just receives a fresh 307 and goes straight
+to the CDN. **The cache hit rate on actual blob payload is zero.** This
+is the anti-pattern this design must explicitly avoid.
+
+**Behaviour C** is a deliberate nginx-only escape hatch for cases where
+A is impossible (e.g. Hugging Face has no OCI surface): proxy directly
+at the CDN with `proxy_cache_key` set to strip signed query parameters
+so the same blob digest collapses to one cache entry regardless of
+signature drift.
+
+**Implication for HAProxy:** our HAProxy hashing is **unaffected** by
+the CDN split. Every cache exposes the OCI Distribution surface on its
+frontend port; the redirect happens *inside* the cache, never on the
+HAProxy hop. `balance uri whole` continues to hash on
+`/v2/…/blobs/sha256:<digest>` exactly as before, and the same digest
+keeps landing on the same cache backend → same cache file.
+
+### 6.3 Egress allowlist on the experiment subnet
+
+For cache misses to succeed, the cache VMs must reach **all** of the
+upstream host classes above. nftables masquerade on `cachebr0` lets the
+VMs out unconditionally; we explicitly do **not** add DNS-based egress
+control in v1 (a `dnsmasq` allowlist is future work).
+
+If this is ever moved to a restricted network, the egress allowlist is
+the union of:
+
+- All three rows in the table above (Docker Hub).
+- `gcr.io` itself and `storage.googleapis.com` (gcr.io's blob layer
+  follows the same redirect-to-cloud-storage pattern).
+- `huggingface.co` and `cdn-lfs.huggingface.co` (LFS-hosted model
+  files redirect to a Cloudflare-backed LFS host).
+
+This list is wired into `constants.nix` as `upstreams.<name>.egressHosts`
+so the same data feeds a future allowlist module.
+
+---
+
+## 7. Constants Module (`nix/constants.nix`)
 
 Centralising everything in one file is what makes the other repos easy to
 read and modify; we follow the same pattern. Sketch (final file will be
@@ -354,9 +474,9 @@ IP or port anywhere else** in the tree.
 
 ---
 
-## 7. MicroVM Definitions
+## 8. MicroVM Definitions
 
-### 7.1 Common shape
+### 8.1 Common shape
 
 Both generators follow the
 [`nix/microvm.nix`](../../ceph-on-k8s/nix/microvm.nix) pattern from
@@ -420,7 +540,7 @@ nixpkgs.lib.nixosSystem {
 `registryProxyModule`, `zotProxyModule`, and `nginxCacheModule` instead of
 the client modules, and uses `vmResources.cache`.
 
-### 7.2 What each VM runs
+### 8.2 What each VM runs
 
 | VM             | NixOS modules                                                       |
 |----------------|---------------------------------------------------------------------|
@@ -433,7 +553,7 @@ The two clients are also identical to each other. A second client exists
 so we can demonstrate cache locality (same image, two clients → second
 pull should hit the warm cache regardless of which client requested first).
 
-### 7.3 Data disks
+### 8.3 Data disks
 
 Each VM gets a single `<hostname>-data.img` mounted at `/var/lib`:
 
@@ -446,9 +566,9 @@ same way `k8s-vm-wipe` does in the sister repos.
 
 ---
 
-## 8. Cache Services on the Cache MicroVMs
+## 9. Cache Services on the Cache MicroVMs
 
-### 8.1 Docker Distribution registry (proxy mode)
+### 9.1 Docker Distribution registry (proxy mode)
 
 [`distribution/distribution`](https://github.com/distribution/distribution)
 is the reference OCI registry; in *proxy mode* it acts as a pull-through
@@ -494,7 +614,18 @@ Notes:
   be triggered manually (`registry garbage-collect` CLI). For experiments
   we just wipe the data disk.
 
-### 8.2 Zot
+**Behaviour against the Docker Hub CDN (post 2026-05-20).**
+Distribution-in-proxy-mode implements **behaviour A** from §6.2.
+When upstream `registry-1.docker.io` answers a blob GET with a 307 to
+`production.cloudfront.docker.com`, Distribution's internal HTTP client
+follows the redirect, downloads the blob bytes from the CDN, stores
+them under `rootdirectory` keyed by the original `sha256:<digest>`, and
+returns them to our HAProxy / docker client. The signed query
+parameters never leak past Distribution, and the next pull of the same
+digest never leaves the cache subnet. **This is the maximum-caching
+baseline that the other two caches are measured against.**
+
+### 9.2 Zot
 
 [Zot](https://github.com/project-zot/zot) is an OCI-native registry that
 supports multi-upstream sync (`extensions.sync.registries`). Like
@@ -524,7 +655,17 @@ Zot's `onDemand: true` mode is the equivalent of Distribution's proxy
 mode: on a `/v2/<name>/manifests/<ref>` request, Zot fetches from upstream
 if absent, stores locally, then serves. Health: `GET /v2/` returns 200.
 
-### 8.3 Nginx as an HTTP proxy cache
+**Behaviour against the Docker Hub CDN (post 2026-05-20).**
+Zot's sync extension uses the `containers-image` Go library, which
+transparently follows 3xx redirects to CloudFront / Cloudflare / R2,
+pins the blob locally under `rootDirectory` keyed by digest, and serves
+subsequent pulls from disk. Same caching profile as Distribution — no
+upstream traffic for a warm digest. In practice Zot's logs are more
+verbose about which CDN edge it fetched from (look for
+`production.cloudfront` or `cloudflarestorage` in `/var/log/zot/zot.log`),
+which is useful when debugging cache-miss latency variance.
+
+### 9.3 Nginx as an HTTP proxy cache
 
 For Hugging Face, where we want to cache **arbitrary HTTP downloads**
 rather than OCI blobs, nginx with `proxy_cache` is the standard tool. We
@@ -581,9 +722,105 @@ Caveats nginx specifically gives us:
   `proxy_pass https://huggingface.co;` and a different cache zone /
   directory.
 
+**Behaviour against the Docker Hub CDN (post 2026-05-20) — this is the
+hard one.** Naïvely configured nginx falls into **behaviour B** from
+§6.2: `proxy_pass https://registry-1.docker.io;` forwards the 307 to
+dockerd unchanged, dockerd opens its own connection straight to
+CloudFront, and **nginx never sees the blob bytes — cache hit rate on
+payload is zero**. This is exactly the anti-pattern this design must
+avoid.
+
+There are two ways to make nginx serve as a real cache for
+CDN-redirected blob traffic, and we will implement both in
+`nix/modules/nginx-cache.nix` to compare them:
+
+**Option 1 — Make nginx follow the redirect itself, key by digest
+(recommended).**
+Use `proxy_intercept_errors` + an internal redirect to a `@cdn`
+location that fetches the body from the CDN host. Sketch:
+
+```nginx
+proxy_cache_path /var/lib/cache/nginx/docker
+                 levels=1:2 keys_zone=cache_docker:50m
+                 max_size=200g inactive=30d use_temp_path=off;
+
+server {
+    listen 8080;
+    resolver 1.1.1.1 ipv6=off;   # for dynamic Location: host lookups
+
+    location / {
+        proxy_pass https://registry-1.docker.io;
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        # Trap the 307 from upstream and dispatch internally
+        error_page 301 302 303 307 308 = @follow_cdn;
+        proxy_cache cache_docker;
+        # Cache manifests + small responses keyed on the request URI
+        proxy_cache_key "$request_method:$uri";
+        proxy_cache_valid 200 30d;
+    }
+
+    location @follow_cdn {
+        # Pull the Location: header out of the upstream 307
+        set $cdn_url $upstream_http_location;
+        proxy_pass $cdn_url;
+        proxy_cache cache_docker;
+        # KEY POINT: cache key is the ORIGINAL request URI (which still
+        # contains /v2/<name>/blobs/sha256:<digest>), with the signed
+        # CDN query params deliberately excluded. Same digest → same
+        # cache entry, regardless of signature drift.
+        proxy_cache_key "blob:$uri";
+        proxy_cache_valid 200 30d;
+        proxy_cache_lock on;
+        # CDN edge may differ between pulls; do not 502 on hostname change
+        proxy_next_upstream error timeout http_502 http_504;
+    }
+}
+```
+
+The load-bearing trick is `proxy_cache_key "blob:$uri"` in the
+`@follow_cdn` block: `$uri` is still `/v2/<name>/blobs/sha256:<digest>`
+from the *original* request because nginx preserves the request URI
+across the internal redirect. The signed query string lives in `$args`
+on the upstream side but is excluded from our cache key. **Same digest
+→ same cache entry, regardless of which CDN edge served it or what the
+signature was.**
+
+**Option 2 — Point nginx directly at the CDN with a custom path
+prefix.** Expose `/cdn/<digest>` on nginx and rewrite to the CDN host.
+Sidesteps the redirect dance, but requires the client to know that
+blobs come from `/cdn/<digest>` instead of `/v2/<name>/blobs/<digest>`.
+`dockerd` will not do this. Works only for `curl`-driven Hugging Face
+downloads where we control the URL the CLI uses. We use **Option 1 for
+the dockerhub / gcr.io nginx instances** and **Option 2 only for the
+Hugging Face instance**.
+
+**Cache-key normalisation rule.** For every nginx instance the cache
+key MUST be:
+
+```nginx
+proxy_cache_key "$request_method:$uri";
+```
+
+with `$args` explicitly **omitted**. This is the single knob that makes
+the signed-URL CDN model behave under maximum-caching assumptions.
+Including `$args` would generate a fresh cache key on every pull
+because the signature differs each time — exactly the anti-caching
+footgun.
+
+**Why we still bother with nginx at all.** Distribution and Zot are
+*better* for `docker.io` / `gcr.io` because they understand OCI. The
+point of also testing nginx for OCI is:
+
+1. **Hugging Face is HTTP, not OCI** — we need a generic HTTP cache,
+   and nginx is the canonical one.
+2. We want a head-to-head between a *generic* and *OCI-aware* cache
+   when both are tuned for maximum caching. Option 1 above is the fair
+   comparison; the naïve config is the cautionary tale.
+
 ---
 
-## 9. Client-side HAProxy: health checks and consistent hashing
+## 10. Client-side HAProxy: health checks and consistent hashing
 
 The HAProxy on each client implements the routing pattern lifted from
 the `moby-image-pull-analysis.md` recommendations: **`balance uri whole`
@@ -676,9 +913,9 @@ so adding a new cache type is "add an entry in `constants.nix`, rebuild".
 
 ---
 
-## 10. Client-side Docker daemon configuration
+## 11. Client-side Docker daemon configuration
 
-### 10.1 `registry-mirrors` vs `insecure-registries`
+### 11.1 `registry-mirrors` vs `insecure-registries`
 
 These two `daemon.json` keys are often confused, and the example in your
 notes (`{"registry-mirrors": [...], "insecure-registries": [...]}` with
@@ -747,7 +984,7 @@ TLS), we need **both**:
 > and `ceph-on-k8s`. For v1 we accept the simpler HTTP-only setup since
 > the bridge is private.
 
-### 10.2 Switching the cache under test
+### 11.2 Switching the cache under test
 
 `registry-mirrors` only ever affects `docker.io`, so the main switching
 story is: *which cache backend handles the `docker.io` workload?*
@@ -788,7 +1025,300 @@ the harness supports them.
 
 ---
 
-## 11. Build and run workflow
+## 12. Alternative: transparent HTTPS MITM via HAProxy (full-control mode)
+
+The design in §10–§11 routes traffic through HAProxy by *configuring*
+dockerd (`registry-mirrors` + `insecure-registries`). It works, but it
+inherits two limitations of dockerd's mirror plumbing:
+
+1. `registry-mirrors` covers **only `docker.io`**. Pulls of
+   `gcr.io/foo/bar` skip the mirror entirely and go direct to upstream.
+2. Hugging Face downloads aren't OCI pulls at all, so dockerd's mirror
+   config doesn't help them either.
+
+This section explores a stronger alternative: **transparent HTTPS
+interception** at HAProxy, where dockerd makes vanilla HTTPS calls and
+HAProxy terminates the TLS on the fly using certs we minted. With our
+own CA installed in the client trust store, **every** upstream pull
+(docker.io, gcr.io, anything) is intercepted with no per-namespace
+client config — and HAProxy gets to see the decrypted URI for
+consistent hashing. The user has explicitly signed off on breaking the
+HTTPS end-to-end guarantee because the host, both VMs, and both CAs
+are all under our control.
+
+### 12.1 Why a vanilla HTTPS_PROXY doesn't help
+
+dockerd's distribution HTTP client uses
+`http.ProxyFromEnvironment`, see
+[`daemon/internal/distribution/registry.go:87`](../../moby/daemon/internal/distribution/registry.go)
+and [`daemon/pkg/registry/registry.go:137`](../../moby/daemon/pkg/registry/registry.go).
+It also explicitly forwards `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
+from daemon config to its child processes
+([`daemon/command/daemon.go:1121-1125`](../../moby/daemon/command/daemon.go)),
+so a NixOS systemd drop-in like:
+
+```nix
+systemd.services.docker.environment.HTTPS_PROXY = "http://127.0.0.1:3128";
+```
+
+makes dockerd route every HTTPS pull through `127.0.0.1:3128`. Good
+news — but for HTTPS the proxy protocol is:
+
+```
+client ──► proxy   CONNECT registry-1.docker.io:443 HTTP/1.1
+client ◄── proxy   HTTP/1.1 200 Connection established
+client ◄═══════════════════════════════════════════════════►  upstream
+                  (TLS handshake + encrypted HTTP, end-to-end)
+```
+
+The proxy opens a TCP tunnel and copies bytes blindly in both
+directions. **The TLS handshake and all subsequent HTTP requests are
+encrypted between the client and the real upstream** — the proxy
+cannot see `/v2/<name>/blobs/sha256:<digest>`, cannot route on it,
+cannot consistent-hash on it, and cannot cache it. HTTPS_PROXY alone
+gets us nothing for caching.
+
+### 12.2 The MITM solution: own the CA, mint certs, terminate TLS at HAProxy
+
+Because we control the clients, we can give them a custom root CA and
+then have HAProxy present certificates that *appear* to be the
+upstream's. From dockerd's perspective the TLS handshake succeeds
+normally; from HAProxy's perspective the traffic is decrypted HTTP
+ready for routing and caching.
+
+Two implementation routes lead to the same outcome, with different
+trade-offs.
+
+#### Route A — Explicit proxy + CONNECT + SSL bumping
+
+Keep `HTTPS_PROXY=http://localhost:3128` on the client and have the
+proxy do "SSL bumping": instead of opening a tunnel on receipt of
+`CONNECT registry-1.docker.io:443`, the proxy *itself* mints a cert
+for `registry-1.docker.io` (signed by our CA), presents it to the
+client, completes the TLS handshake locally, then reads the decrypted
+HTTP request.
+
+- **HAProxy alone cannot do this.** SSL bumping for arbitrary SNI
+  requires dynamic cert minting, which is squid (`ssl_bump`) or
+  mitmproxy territory.
+- Architecturally that means: `dockerd → squid (SSL bump) → HAProxy
+  (consistent hashing) → cache backend`. An extra component, but the
+  cert list is **unbounded** (squid mints whatever SNI the client
+  asks for).
+- **Pros:** truly transparent to dockerd; no DNS or `/etc/hosts`
+  surgery; survives new CDN hostnames appearing.
+- **Cons:** introduces squid (or mitmproxy); two TLS terminations per
+  connection (client→squid, squid→upstream); operationally heavier.
+
+#### Route B — DNS poisoning + SNI-based static cert selection at HAProxy (recommended)
+
+Skip the proxy env var entirely. Make all intercepted upstream FQDNs
+resolve to the local HAProxy IP via `/etc/hosts` on the client. HAProxy
+listens on `:443` with a **pre-minted cert per upstream FQDN** loaded
+via `crt-list`, and selects the matching cert from the client's SNI.
+
+- **Pure HAProxy.** No squid, no mitmproxy.
+- HAProxy's `bind ... ssl crt-list /etc/haproxy/upstream-certs.list`
+  + `ssl_fc_sni` ACLs is a well-trodden path.
+- The list of FQDNs is finite, known (see §6), and already
+  centralised in `constants.nix` under `upstreams.*.egressHosts`.
+- **Pros:** one fewer component, fits the existing HAProxy-centric
+  design, lets HAProxy do the consistent hashing directly on the
+  decrypted URI just like in §10.
+- **Cons:** an upfront FQDN allowlist must be maintained; if Docker
+  rotates to a new CDN hostname we'd have to mint a new cert (but
+  see §12.6 — the caches dereference CDN redirects internally, so
+  this concern is far smaller than it looks).
+
+**We recommend Route B for v1.** Route A remains available as a v2
+escape hatch if list maintenance becomes painful.
+
+### 12.3 PKI design
+
+A new flake app `cache-gen-ca` creates the lab CA, modelled on
+`secrets-gen.nix` in `ceph-on-k8s`. Layout:
+
+```
+secrets/
+├── ssh/...                                 # existing
+└── ca/
+    ├── root-ca.key                         # 4096-bit RSA, only used to sign
+    ├── root-ca.crt                         # self-signed, 10y validity
+    ├── intermediate.key                    # for day-to-day signing (kept around for rotation)
+    ├── intermediate.crt                    # signed by root-ca, 5y validity
+    └── upstream/                           # one cert per upstream FQDN
+        ├── registry-1.docker.io.crt
+        ├── registry-1.docker.io.key
+        ├── gcr.io.crt
+        ├── gcr.io.key
+        ├── huggingface.co.crt
+        ├── huggingface.co.key
+        └── cdn-lfs.huggingface.co.{crt,key}
+```
+
+`step-cli` is the right tool for this (already a dev-shell dep in
+`nix-k8s-examples`); it can mint per-FQDN certs in one line. The
+upstream list is read from `constants.nix.mitm.upstreamHosts`, so
+adding an FQDN is one entry + `nix run .#cache-gen-ca`.
+
+### 12.4 Trust insertion on the client VMs
+
+In `nix/microvm-client.nix`, the root CA is added to the system trust
+store via NixOS's built-in mechanism:
+
+```nix
+security.pki.certificateFiles = [ ../secrets/ca/root-ca.crt ];
+```
+
+That single line installs `root-ca.crt` into `/etc/ssl/certs/ca-bundle.crt`
+and the per-format directories Docker and Go look at. Go's
+`crypto/x509.SystemCertPool` (which `net/http` uses) picks it up
+automatically.
+
+We deliberately do **not** install the CA on the cache VMs — they need
+to validate *real* upstream certs when fetching content for cache
+misses. This asymmetry is the load-bearing trick that prevents the
+MITM loop closing in on itself.
+
+### 12.5 DNS poisoning (just `/etc/hosts` for v1)
+
+In `nix/microvm-client.nix`:
+
+```nix
+networking.hosts = {
+  "10.44.44.10" = [
+    "registry-1.docker.io"
+    "gcr.io"
+    "huggingface.co"
+    "cdn-lfs.huggingface.co"
+  ];
+  # NOTE: client0's own IP is 10.44.44.10; client1 swaps in .11
+  #       (the local HAProxy listens on the client's own address)
+};
+```
+
+**Critically, the auth hosts and CDN hosts are NOT poisoned:**
+
+- `auth.docker.io`, `auth.docker.com`, `login.docker.com` —
+  not intercepted. dockerd talks to the real Docker Hub auth servers
+  to mint bearer tokens. Those calls are short, infrequent, and
+  uncacheable (signed JWTs).
+- `production.cloudfront.docker.com`,
+  `production.cloudflare.docker.com`,
+  `docker-images-prod.<hash>.r2.cloudflarestorage.com` —
+  not intercepted from the client either. **The cache backends
+  (Distribution / Zot) dereference these redirects internally as
+  described in §6.2 / §9.1 / §9.2**, so dockerd never sees a 307 in
+  this mode and never connects to a CDN host. If we ever switch to
+  nginx Option 1 (which itself follows 307s server-side) the same
+  property holds.
+
+This is a happy outcome: the MITM allowlist shrinks to just the OCI
+API hosts plus Hugging Face's own hostnames — **three or four FQDNs
+total**, not the dozen-plus you'd need if MITM also had to cover the
+CDN edges.
+
+For v2, replace `/etc/hosts` with a `dnsmasq` instance on the client
+VM that does the same poisoning but supports wildcards (useful if
+Hugging Face starts using `*.cdn-lfs.huggingface.co`).
+
+### 12.6 HAProxy frontend with SNI termination
+
+```haproxy
+frontend mitm
+    bind 10.44.44.10:443 ssl crt-list /etc/haproxy/upstream-certs.list alpn h2,http/1.1
+    mode http
+
+    # Route on SNI to the upstream-specific backend pool. Same
+    # balance uri whole + consistent hashing as the registry-mirrors
+    # path in §10 — HAProxy now sees the decrypted URI, so the hash
+    # input is exactly /v2/<name>/blobs/sha256:<digest>.
+    acl sni_docker_io  ssl_fc_sni -i registry-1.docker.io
+    acl sni_gcr_io     ssl_fc_sni -i gcr.io
+    acl sni_hf         ssl_fc_sni -i huggingface.co
+    acl sni_hf_lfs     ssl_fc_sni -i cdn-lfs.huggingface.co
+
+    use_backend be_oci_docker if sni_docker_io
+    use_backend be_oci_gcr    if sni_gcr_io
+    use_backend be_hf         if sni_hf
+    use_backend be_hf_lfs     if sni_hf_lfs
+
+# crt-list /etc/haproxy/upstream-certs.list contains:
+#   /var/lib/haproxy/certs/registry-1.docker.io.pem
+#   /var/lib/haproxy/certs/gcr.io.pem
+#   /var/lib/haproxy/certs/huggingface.co.pem
+#   /var/lib/haproxy/certs/cdn-lfs.huggingface.co.pem
+# Each .pem is the per-FQDN cert concatenated with its private key
+# (HAProxy's combined PEM format).
+```
+
+The backends are exactly the same backends already defined in §10 —
+nothing changes from the cache's perspective. The caches still see
+OCI Distribution `/v2/...` requests on their existing ports, still
+return blob bytes keyed by digest, still dereference CDN redirects
+internally.
+
+### 12.7 Switching between caches in MITM mode
+
+The Host-header switching trick from §11.2 doesn't work here, because
+the SNI is fixed to the upstream FQDN. Two options:
+
+**(a) Per-cache MITM listen addresses.** Bind HAProxy on three
+loopback aliases: `127.0.0.10` for Distribution, `127.0.0.11` for
+Zot, `127.0.0.12` for nginx. The `networking.hosts` entry for
+`registry-1.docker.io` points at one of them; switching =
+`cache-set-mirror --cache=zot` rewrites `/etc/hosts` and triggers
+`systemctl reload network`. dockerd needs no restart because Go's
+resolver re-reads `/etc/hosts` on each lookup.
+
+**(b) Dynamic backend selection at HAProxy.** A single MITM listener
+with a runtime-switchable backend via a HAProxy stick-table key or a
+file map (`http-request set-var(req.cache_choice) … if { … }`).
+Switching is `echo zot > /etc/haproxy/active-cache && systemctl
+reload haproxy`. Heavier reload but no DNS resolver caching
+concerns.
+
+Recommend (a) — same UX as the registry-mirrors mode (`cache-set-mirror`
+swaps a config file and reloads one service), no HAProxy reload.
+
+### 12.8 Trade-offs vs the `registry-mirrors` mode
+
+| Property                                       | registry-mirrors mode (§10–§11) | MITM mode (this section)                                           |
+|------------------------------------------------|---------------------------------|--------------------------------------------------------------------|
+| Upstreams covered transparently                | docker.io only                  | docker.io + gcr.io + huggingface.co + anything we mint a cert for  |
+| Client-side config burden                      | `daemon.json` (one file)        | Trust the CA + `/etc/hosts` entries                                |
+| Cache routing                                  | HAProxy ACL on `Host:` header   | HAProxy ACL on `ssl_fc_sni`                                        |
+| HAProxy hashing input                          | decrypted URI                   | decrypted URI (same)                                               |
+| Number of FQDNs needing cert/poison entries    | 0                               | ~3–4 (just OCI API hosts; CDN hosts handled by caches)             |
+| Visible to existing tooling (`docker pull foo`) | yes, unchanged                  | yes, unchanged                                                     |
+| Visible to `gcr.io/...` and `huggingface.co/...` pulls | no                       | **yes** — this is the headline win                                 |
+| Risk surface                                   | low (only `docker.io` redirected) | medium (we are spoofing real-internet hosts; restricted to the lab subnet) |
+| Survives upstream changing CDN host            | yes (caches handle it)          | yes (caches still handle it; no client cert touches CDN)           |
+
+### 12.9 Why we keep both modes available
+
+Both modes share **all** the cache-side infrastructure (Distribution,
+Zot, nginx, their on-disk stores) and the HAProxy backend pools. They
+differ only in the listener: an HTTP frontend with Host-header ACLs
+(registry-mirrors mode) vs a TLS-terminating frontend with SNI ACLs
+(MITM mode). Both are useful experiments:
+
+- **registry-mirrors mode** is what a docker-only shop would deploy
+  in production without breaking trust. It's the comparison baseline.
+- **MITM mode** is what a homelab / restricted-network operator who
+  trusts their internal infrastructure can deploy to cache
+  **everything**, not just `docker.io`. It's the upper bound of how
+  much upstream traffic we can avoid.
+
+A flake app `cache-set-mode` flips a client between the two by
+toggling whether HAProxy's HTTP frontend (port `8088`) or its TLS
+frontend (port `443`) is the one dockerd is steered toward. Both can
+even run simultaneously; we just don't recommend it for clean
+measurements.
+
+---
+
+## 13. Build and run workflow
 
 Mirrors the apps exposed by `nix-k8s-examples`/`ceph-on-k8s`:
 
@@ -828,7 +1358,7 @@ Additional helpers we will add:
 
 ---
 
-## 12. Design choices to validate
+## 14. Design choices to validate
 
 A few decisions in this doc are reasonable defaults but worth poking at
 before implementing:
@@ -871,9 +1401,55 @@ before implementing:
    generic HTTP. nginx is the right tool for HF blob caching, and the
    HF CLI is happy to talk to an arbitrary URL.
 
+7. **Nginx redirect-following config (Option 1 in §9.3).** Relies on
+   `error_page 307 = @follow_cdn` + `$upstream_http_location` — verify
+   this actually traps the 307 across the nginx versions we pin, and
+   that the CDN response is cached under the digest-only key. A
+   misconfiguration here turns nginx-for-dockerhub into a pure
+   passthrough with zero hit rate — exactly the anti-pattern we are
+   trying to avoid.
+
+8. **CDN affinity over time.** Repeat pulls of the same blob may land
+   on different CDN edges (CloudFront vs Cloudflare vs R2 depending on
+   plan tier and geography). Distribution / Zot are insulated because
+   they store by digest, but nginx Option 1 needs to tolerate
+   `Location:` URLs whose hostname changes between pulls. Confirm by
+   counting distinct upstream hosts in nginx access logs across N
+   pulls of the same image.
+
+9. **Authenticated vs anonymous Docker Hub pulls.** v1 is anonymous
+   pulls, which land on
+   `docker-images-prod.<hash>.r2.cloudflarestorage.com` (Cloudflare
+   R2). If we extend to authenticated pulls we will mostly land on
+   `production.cloudfront.docker.com` instead. Cache behaviour should
+   be identical from the digest-keyed perspective, but worth measuring
+   end-to-end.
+
+10. **MITM mode SNI list completeness.** Route B in §12 only mints
+    certs for OCI API hosts (and HF). The reasoning is that CDN
+    redirects are handled inside the cache backends and the client
+    never connects to a CDN host. Verify this empirically by tracing
+    a fresh pull from `client0` and confirming no traffic leaves the
+    bridge to a `*.cloudfront.docker.com` / `*.cloudflarestorage.com`
+    destination from the client's IP. If anything does leak, mint a
+    cert for that host too.
+
+11. **MITM-mode cache switching mechanism.** §12.7 sketches two
+    options (loopback-alias listeners vs runtime HAProxy backend
+    switch). Pick one in implementation and validate that switching
+    is fast (<1s) and visible (e.g. `docker info` or HAProxy stats
+    reflects it). Mismatch between selected cache and observed
+    behaviour is the most likely source of measurement confusion.
+
+12. **Trust-store rotation.** The CA in `secrets/ca/` is long-lived
+    (10y root, 5y intermediate). Per-FQDN certs are shorter (e.g.
+    1y). A flake app `cache-rotate-mitm-certs` should be able to
+    re-mint every per-FQDN cert from the existing intermediate and
+    hot-reload HAProxy. Validate before we end up wedged at expiry.
+
 ---
 
-## 13. Future work
+## 15. Future work
 
 - **Workload generator.** A reproducible pull corpus (top-50 docker.io
   images, a fixed set of gcr.io k8s images, a couple of HF models) so we
@@ -891,3 +1467,17 @@ before implementing:
 - **containerd `hosts.toml` path.** Once we want to compare what
   containerd's per-registry mirror config does differently to dockerd's
   global mirror, we add a second client variant.
+- **Per-CDN cache-miss accounting.** Now that blobs come from one of
+  three CDN endpoints, log which CDN host the cache fetched from on a
+  miss and whether that affects miss latency. Hook into Distribution
+  middleware / Zot's structured logs / nginx access logs to record
+  `$upstream_addr`.
+- **DNS-based egress allowlist.** A `dnsmasq` allowlist on `cachebr0`
+  that permits only the hosts in §6.3, so accidental traffic to other
+  upstreams during experiments is visible.
+- **MITM Route A (HTTPS_PROXY + SSL bumping)** as a v2 option, using
+  squid or mitmproxy in front of HAProxy. Worth doing if the v1
+  per-FQDN cert list in §12.3 turns out to be painful to maintain.
+- **Wildcard DNS poisoning via `dnsmasq`** on the client VMs, replacing
+  the static `networking.hosts` list in §12.5. Useful if any of our
+  upstreams move to a wildcard-CDN pattern like `*.cdn-lfs.huggingface.co`.
