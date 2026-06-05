@@ -73,9 +73,16 @@ hostname, port, and resource size.
    2. [Zot](#92-zot)
    3. [Nginx as an HTTP proxy cache](#93-nginx-as-an-http-proxy-cache)
 10. [Client-side HAProxy: health checks and consistent hashing](#10-client-side-haproxy-health-checks-and-consistent-hashing)
-11. [Client-side Docker daemon configuration](#11-client-side-docker-daemon-configuration)
-    1. [`registry-mirrors` vs `insecure-registries`](#111-registry-mirrors-vs-insecure-registries)
-    2. [Switching the cache under test](#112-switching-the-cache-under-test)
+11. [Client-side: per-registry transparent mirroring](#11-client-side-per-registry-transparent-mirroring)
+    1. [Mode 1 (primary): containerd `hosts.toml` per-registry mirrors](#111-mode-1-primary-containerd-hoststoml-per-registry-mirrors)
+        1. [Why this works today](#1111-why-this-works-today)
+        2. [The `ns=` query parameter — the routing key HAProxy needs](#1112-the-ns-query-parameter--the-routing-key-haproxy-needs)
+        3. [Tier 1: dedicated cache instances per upstream](#1113-tier-1-dedicated-cache-instances-per-upstream)
+        4. [Per-registry `hosts.toml` files](#1114-per-registry-hoststoml-files)
+        5. [The `_default` wildcard with a dynamic nginx catch-all](#1115-the-_default-wildcard-with-a-dynamic-nginx-catch-all)
+        6. [Switching the cache type under test](#1116-switching-the-cache-type-under-test)
+    2. [Mode 2: HTTPS MITM via HAProxy (see §12)](#112-mode-2-https-mitm-via-haproxy-see-12)
+    3. [Mode 3: legacy `daemon.json` registry-mirrors (comparison baseline)](#113-mode-3-legacy-daemonjson-registry-mirrors-comparison-baseline)
 12. [Alternative: transparent HTTPS MITM via HAProxy (full-control mode)](#12-alternative-transparent-https-mitm-via-haproxy-full-control-mode)
     1. [Why a vanilla HTTPS_PROXY doesn't help](#121-why-a-vanilla-https_proxy-doesnt-help)
     2. [The MITM solution: own the CA, mint certs, terminate TLS at HAProxy](#122-the-mitm-solution-own-the-ca-mint-certs-terminate-tls-at-haproxy)
@@ -226,27 +233,31 @@ The pattern is copied verbatim from
 names and the **absence** of the apiserver HAProxy section (we don't need
 it).
 
-**Cache backend ports — one per `(cache_type, upstream)` pair.**
-This lets HAProxy expose every combination independently for measurement:
+**Cache backend ports — one per `(cache_type, upstream)` pair.** Five
+Tier-1 OCI upstreams (see §11.1.3 for rationale) × three cache
+implementations = 15 OCI backends, plus a wildcard nginx for
+`_default` (§11.1.5) and a non-OCI nginx for Hugging Face:
 
-| port | cache              | upstream         |
-|------|--------------------|------------------|
-| 5000 | distribution proxy | `docker.io`      |
-| 5001 | distribution proxy | `gcr.io`         |
-| 5050 | Zot                | `docker.io`      |
-| 5051 | Zot                | `gcr.io`         |
-| 8080 | nginx proxy_cache  | `docker.io`      |
-| 8081 | nginx proxy_cache  | `gcr.io`         |
-| 8082 | nginx proxy_cache  | `huggingface.co` |
+| port band     | cache type             | upstream                                                             |
+|---------------|------------------------|----------------------------------------------------------------------|
+| `5000`–`5004` | Distribution proxy     | one port per Tier-1 upstream (`docker.io`, `gcr.io`, `ghcr.io`, `quay.io`, `registry.k8s.io`) |
+| `5050`–`5054` | Zot                    | same five Tier-1 upstreams                                           |
+| `8080`–`8084` | nginx (Option-1 §9.3)  | same five Tier-1 upstreams                                           |
+| `8085`        | nginx wildcard         | `_default` — dynamic `proxy_pass https://$arg_ns;` for any other reg |
+| `8090`        | nginx                  | `huggingface.co` — HTTP, not OCI                                     |
 
-> A single Zot instance *could* serve both upstreams (its `extensions.sync`
-> block supports a list of `registries`), but running two listeners keeps
-> the port table symmetric across the three cache implementations and
-> lets us swap in path-rewriting later without restructuring.
+> A single Zot instance *could* serve multiple upstreams (its
+> `extensions.sync` block supports a list of `registries`), but
+> running per-upstream listeners keeps the port table symmetric across
+> the three cache implementations and gives us per-upstream isolation
+> for measurement. Catch-all-via-Zot is on the §15 future-work list.
 
-**Client-side HAProxy ports**: HAProxy listens on a single TCP port on
-each client (default **`8088`**) and uses **Host-header ACLs** to route to
-the correct upstream backend pool. See §9.
+**Client-side HAProxy ports.** One frontend port per cache type
+(`8088` Distribution, `8089` Zot, `8090` nginx), each with ACLs on the
+containerd-added `ns=` query parameter routing to the matching
+per-upstream backend pool, with a fallback to the `nginx-default`
+wildcard backend for anything unrecognised. See §10 for the HAProxy
+config and §11.1 for how the client gets steered toward these ports.
 
 ---
 
@@ -403,51 +414,65 @@ rec {
     };
   };
 
-  # ── Cache backends (cache_type × upstream) ─────────────────────────────
+  # ── Upstream registries (Tier 1 = dedicated cache instances) ──────────
   # Used by:
   #   nix/modules/registry-proxy.nix, zot-proxy.nix, nginx-cache.nix → bind
-  #   nix/modules/haproxy-client.nix                                 → upstream pool
-  upstreams = {
-    docker = {
-      url  = "https://registry-1.docker.io";
-      v2   = "/v2/";
-    };
-    gcr = {
-      url  = "https://gcr.io";
-      v2   = "/v2/";
-    };
-    huggingface = {
-      url  = "https://huggingface.co";
-      # nginx-only; not an OCI registry
-    };
+  #   nix/modules/haproxy-client.nix                                 → ns= ACLs
+  #   nix/modules/containerd-mirrors.nix                             → hosts.toml gen
+  # See §11.1.3 for the rationale on this Tier-1 list.
+  ociUpstreams = {
+    docker  = { ns = "docker.io";        url = "https://registry-1.docker.io"; portIndex = 0; };
+    gcr     = { ns = "gcr.io";           url = "https://gcr.io";               portIndex = 1; };
+    ghcr    = { ns = "ghcr.io";          url = "https://ghcr.io";              portIndex = 2; };
+    quay    = { ns = "quay.io";          url = "https://quay.io";              portIndex = 3; };
+    k8s     = { ns = "registry.k8s.io";  url = "https://registry.k8s.io";      portIndex = 4; };
   };
 
-  cacheBackends = {
-    "distribution-docker" = { port = 5000; impl = "distribution"; upstream = "docker"; healthPath = "/v2/"; };
-    "distribution-gcr"    = { port = 5001; impl = "distribution"; upstream = "gcr";    healthPath = "/v2/"; };
-    "zot-docker"          = { port = 5050; impl = "zot";          upstream = "docker"; healthPath = "/v2/"; };
-    "zot-gcr"             = { port = 5051; impl = "zot";          upstream = "gcr";    healthPath = "/v2/"; };
-    "nginx-docker"        = { port = 8080; impl = "nginx";        upstream = "docker"; healthPath = "/health"; };
-    "nginx-gcr"           = { port = 8081; impl = "nginx";        upstream = "gcr";    healthPath = "/health"; };
-    "nginx-huggingface"   = { port = 8082; impl = "nginx";        upstream = "huggingface"; healthPath = "/health"; };
+  # Non-OCI upstreams (nginx-only; consumed by the HF vhost and any future
+  # generic HTTP upstreams)
+  httpUpstreams = {
+    huggingface = { url = "https://huggingface.co"; port = 8090; };
   };
+
+  # Generated programmatically by lib.mapAttrs in the constants module;
+  # shown enumerated here for clarity. 15 OCI backends + 2 nginx specials.
+  cacheBackends =
+    # 5 distribution proxies, one per Tier-1 upstream, ports 5000-5004
+    (lib.mapAttrs' (name: u: lib.nameValuePair "distribution-${name}" {
+       impl = "distribution"; upstream = name;
+       port = 5000 + u.portIndex; healthPath = "/v2/";
+     }) ociUpstreams)
+    # 5 zot instances, ports 5050-5054
+    // (lib.mapAttrs' (name: u: lib.nameValuePair "zot-${name}" {
+         impl = "zot"; upstream = name;
+         port = 5050 + u.portIndex; healthPath = "/v2/";
+       }) ociUpstreams)
+    # 5 nginx vhosts (Option-1 redirect-following per §9.3), ports 8080-8084
+    // (lib.mapAttrs' (name: u: lib.nameValuePair "nginx-${name}" {
+         impl = "nginx"; upstream = name;
+         port = 8080 + u.portIndex; healthPath = "/health";
+       }) ociUpstreams)
+    // {
+      # Wildcard catch-all (§11.1.5) — dynamic ns=-based dispatch
+      "nginx-default"     = { impl = "nginx"; upstream = "_default"; port = 8085; healthPath = "/health"; };
+      # Hugging Face (not OCI; HTTP-only)
+      "nginx-huggingface" = { impl = "nginx"; upstream = "huggingface"; port = 8090; healthPath = "/health"; };
+    };
 
   # ── HAProxy on the clients ─────────────────────────────────────────────
+  # One frontend port per cache type; switching = `cache-set-mirror` flips
+  # which port the hosts.toml files target. See §11.1.6.
   haproxy = {
-    frontendPort = 8088;
-    statsPort    = 8404;
-    # Local hostnames the docker daemon talks to. All resolve to 127.0.0.1
-    # via /etc/hosts (declared in nix/modules/docker-client.nix).
-    # HAProxy ACLs on req.hdr(host) pick the cache_type × upstream pair.
-    routes = {
-      "registry-docker.local"    = "distribution-docker";
-      "registry-gcr.local"       = "distribution-gcr";
-      "zot-docker.local"         = "zot-docker";
-      "zot-gcr.local"            = "zot-gcr";
-      "nginx-docker.local"       = "nginx-docker";
-      "nginx-gcr.local"          = "nginx-gcr";
-      "nginx-huggingface.local"  = "nginx-huggingface";
+    statsPort = 8404;
+    frontends = {
+      distribution = { port = 8088; impl = "distribution"; };
+      zot          = { port = 8089; impl = "zot";          };
+      nginx        = { port = 8090; impl = "nginx";        };  # OCI nginx; not the HF one
     };
+    # ns=<value> → backend pool name (one per Tier-1 upstream).
+    # Generated by lib.mapAttrs over ociUpstreams.
+    # Fallback for unmatched ns= → nginx-default wildcard backend.
+    defaultBackend = "nginx-default";
   };
 
   # ── VM sizing ──────────────────────────────────────────────────────────
@@ -827,7 +852,21 @@ the `moby-image-pull-analysis.md` recommendations: **`balance uri whole`
 + `hash-type consistent sdbm avalanche`**, with `/v2/` health checks that
 accept `200,401` as healthy.
 
-Single listener, Host-header routing to seven backend pools. Sketch:
+**Routing dimension depends on which client-side mode is active (§11):**
+
+- **Mode 1 (hosts.toml)** routes on the `ns=` query parameter that
+  containerd appends — the original registry's hostname. ACL uses
+  `urlp(ns)`.
+- **Mode 2 (MITM)** routes on `ssl_fc_sni` — see §12.6.
+- **Mode 3 (legacy registry-mirrors)** routes on `hdr(host)` — used
+  only for the comparison-baseline benchmark.
+
+All three modes share the same backend pools (one per
+`(cache_type × Tier-1 upstream)` pair, plus the nginx wildcard) so
+swapping mode is a pure frontend concern.
+
+One HAProxy frontend port per cache type (`8088` Distribution,
+`8089` Zot, `8090` nginx). Sketch for the Distribution frontend:
 
 ```haproxy
 global
@@ -849,30 +888,36 @@ frontend stats
     stats uri /stats
     stats refresh 5s
 
-# ─────────────────────────── frontend ──────────────────────────────────
-frontend caches
+# ─────────────────────────── Mode 1 frontend (Distribution) ────────────
+frontend dist_mirror
     bind *:8088
 
-    # Route by Host header to the (cache_type, upstream) pair.
-    acl host_dist_docker hdr(host) -i registry-docker.local
-    acl host_dist_gcr    hdr(host) -i registry-gcr.local
-    acl host_zot_docker  hdr(host) -i zot-docker.local
-    acl host_zot_gcr     hdr(host) -i zot-gcr.local
-    acl host_ngx_docker  hdr(host) -i nginx-docker.local
-    acl host_ngx_gcr     hdr(host) -i nginx-gcr.local
-    acl host_ngx_hf      hdr(host) -i nginx-huggingface.local
+    # Mode 1 (hosts.toml): route on the ns= query parameter containerd
+    # appends. See §11.1.2; ns=<registry> tells us the original upstream
+    # despite Host: being our own mirror.
+    acl ns_docker urlp(ns) -i docker.io
+    acl ns_gcr    urlp(ns) -i gcr.io
+    acl ns_ghcr   urlp(ns) -i ghcr.io
+    acl ns_quay   urlp(ns) -i quay.io
+    acl ns_k8s    urlp(ns) -i registry.k8s.io
 
-    use_backend be_dist_docker if host_dist_docker
-    use_backend be_dist_gcr    if host_dist_gcr
-    use_backend be_zot_docker  if host_zot_docker
-    use_backend be_zot_gcr     if host_zot_gcr
-    use_backend be_ngx_docker  if host_ngx_docker
-    use_backend be_ngx_gcr     if host_ngx_gcr
-    use_backend be_ngx_hf      if host_ngx_hf
+    use_backend be_dist_docker if ns_docker
+    use_backend be_dist_gcr    if ns_gcr
+    use_backend be_dist_ghcr   if ns_ghcr
+    use_backend be_dist_quay   if ns_quay
+    use_backend be_dist_k8s    if ns_k8s
+
+    # No ns= match → bounce to the nginx wildcard catch-all on :8085.
+    # This handles the case where some tool other than containerd (or
+    # an older containerd) forgot to include ns=, so we don't black-hole.
+    default_backend be_ngx_default
+
+# Mirrors for Zot (:8089) and nginx (:8090) follow the same shape with
+# their respective be_zot_* / be_ngx_* backend pools.
 
 # ──────────────────────────── backends ─────────────────────────────────
 # One backend per (cache_type, upstream). All have the SAME shape; only
-# port and health path differ. Generated from constants.cacheBackends.
+# port differs. Generated from constants.cacheBackends.
 
 backend be_dist_docker
     balance uri whole
@@ -884,9 +929,19 @@ backend be_dist_docker
     server cache0 10.44.44.20:5000 check inter 2s fall 3 rise 2
     server cache1 10.44.44.21:5000 check inter 2s fall 3 rise 2
 
-# … be_dist_gcr (5001), be_zot_docker (5050), be_zot_gcr (5051),
-#   be_ngx_docker (8080), be_ngx_gcr (8081), be_ngx_hf (8082) follow
-#   the same shape with `check expect status 200` for the nginx backends.
+backend be_ngx_default
+    # The nginx wildcard catch-all from §11.1.5 — handles any registry
+    # not in Tier 1, dispatching dynamically on ns= internally.
+    balance uri whole
+    hash-type consistent sdbm avalanche
+    option httpchk GET /health
+    server cache0 10.44.44.20:8085 check inter 2s fall 3 rise 2
+    server cache1 10.44.44.21:8085 check inter 2s fall 3 rise 2
+
+# … be_dist_gcr/ghcr/quay/k8s (5001-5004), be_zot_* (5050-5054),
+#   be_ngx_* (8080-8084) follow the same shape with `expect status 200`
+#   for the nginx OCI backends. Generated by lib.mapAttrs in
+#   nix/modules/haproxy-client.nix from constants.cacheBackends.
 ```
 
 Why these knobs (citing the moby analysis):
@@ -913,138 +968,317 @@ so adding a new cache type is "add an entry in `constants.nix`, rebuild".
 
 ---
 
-## 11. Client-side Docker daemon configuration
+## 11. Client-side: per-registry transparent mirroring
 
-### 11.1 `registry-mirrors` vs `insecure-registries`
+This is the section that defines the **user-facing constraint** of the
+lab: external users hand us a Dockerfile that uses *unmodified* image
+references — `FROM nginx`, `FROM gcr.io/google_containers/pause:3.9`,
+`FROM ghcr.io/someorg/someimage:v1`, even
+`FROM registry.k8s.io/etcd:3.6.0` — and we have to intercept and cache
+those pulls without ever touching the Dockerfile.
 
-These two `daemon.json` keys are often confused, and the example in your
-notes (`{"registry-mirrors": [...], "insecure-registries": [...]}` with
-the same host in both) shows why: they answer two different questions
-and you usually need both when the mirror is HTTP-only.
+The cache topology (HAProxy + Distribution + Zot + nginx on the cache
+VMs) is **identical across all three modes** below. Only the mechanism
+that steers dockerd / containerd toward HAProxy changes:
 
-**`registry-mirrors`** — *"Where should I go first for `docker.io` pulls?"*
+| Mode | Mechanism                                                              | Upstreams covered                  | Touches Dockerfile? | Trust impact |
+|------|------------------------------------------------------------------------|------------------------------------|---------------------|--------------|
+| **1** (primary) | `/etc/containerd/certs.d/<host>/hosts.toml` per-registry mirrors | **every registry** (Tier 1 + `_default` wildcard) | no                  | none — plain mirror, no MITM |
+| **2** (alt — see §12) | DNS-poison + HAProxy SNI termination with our CA           | every registry (bounded cert list) | no                  | high — we own the trust |
+| **3** (legacy / comparison baseline) | `daemon.json registry-mirrors` + `insecure-registries` | **docker.io only**                 | no                  | low |
 
-- A list of URLs that dockerd consults **before** going to Docker Hub for
-  anything in the `docker.io` namespace.
-- They are tried **in list order**; if a mirror responds with anything
-  other than success, dockerd falls back to the next mirror, and finally
-  to Docker Hub itself.
-- **Applies only to `docker.io`**. Pulls of `gcr.io/foo/bar` or
-  `quay.io/baz` are sent direct to the named registry, regardless of this
-  list.
-- Default scheme is `https`. dockerd does not by default speak HTTP to a
-  mirror.
+**Mode 1 is the recommended primary** because it is the only one that
+both (a) requires zero Dockerfile changes from the user and (b) covers
+arbitrary registry hostnames without breaking TLS trust. Mode 2 is the
+escape hatch when Mode 1 is unavailable (e.g. dockerd is configured
+with the legacy graphdriver image store, or userns remapping). Mode 3
+is kept around purely so we can A/B it against Modes 1 and 2 in
+benchmarks.
 
-**`insecure-registries`** — *"Which registry hosts am I allowed to talk
-to over plain HTTP / with a self-signed cert?"*
+### 11.1 Mode 1 (primary): containerd `hosts.toml` per-registry mirrors
 
-- A list of `host[:port]` (or CIDR) entries that:
-  1. Allow plain HTTP if HTTPS is not reachable.
-  2. Skip TLS verification if HTTPS is reachable but the cert is invalid.
-- It is **not** a routing directive — it does not redirect pulls. It only
-  relaxes TLS rules for the listed hosts.
-- The two lists are independent; they have overlap **only** because most
-  internal mirrors happen to be both "the registry I want to use" and
-  "not behind a real TLS cert".
+#### 11.1.1 Why this works today
 
-**Recommendation for this lab.**
+Modern `dockerd` defaults to the **containerd image store** rather
+than its legacy graphdriver-based puller. See
+[`daemon/image_store_choice.go:105,117-118`](../../moby/daemon/image_store_choice.go) — the default is `imageStoreChoiceContainerd`,
+and explicit `"containerd-snapshotter": true` in `daemon.json` now logs
+a warning that *"`containerd-snapshotter` is now the default and no
+longer needed to be set"*. The only Linux carve-out is userns
+remapping ([`daemon/command/daemon_linux.go:30-40`](../../moby/daemon/command/daemon_linux.go)).
 
-Because HAProxy on each client listens on `http://127.0.0.1:8088` (no
-TLS), we need **both**:
+Once the image store is containerd, **every image pull goes through
+containerd's resolver**, and that resolver reads per-registry mirror
+configuration from `/etc/containerd/certs.d/<registry>/hosts.toml`
+(walker: [`containerd/core/remotes/docker/config/config_unix.go:25-37`](../../containerd/core/remotes/docker/config/config_unix.go),
+loader: [`containerd/core/remotes/docker/config/hosts.go:293-304`](../../containerd/core/remotes/docker/config/hosts.go)).
 
-```json
-{
-  "registry-mirrors": ["http://registry-docker.local:8088"],
-  "insecure-registries": [
-    "registry-docker.local:8088",
-    "registry-gcr.local:8088",
-    "zot-docker.local:8088",
-    "zot-gcr.local:8088",
-    "nginx-docker.local:8088",
-    "nginx-gcr.local:8088",
-    "nginx-huggingface.local:8088"
-  ]
+This is the *only* mechanism in the stack that:
+
+1. Is per-registry (`docker.io`, `gcr.io`, `ghcr.io`, … all configured
+   independently), and
+2. Supports a true catch-all (`_default` directory: same file
+   `config_unix.go:32-33`), and
+3. Has built-in graceful fallback to the real upstream on cache
+   failure (mirror walk:
+   [`containerd/core/remotes/docker/resolver.go:287-349`](../../containerd/core/remotes/docker/resolver.go) — non-final mirrors fall
+   through silently on error; only the last host gets retries).
+
+#### 11.1.2 The `ns=` query parameter — the routing key HAProxy needs
+
+When containerd pulls `gcr.io/foo/bar:latest` through a mirror at
+`http://10.44.44.10:8088`, the actual HTTP request it sends is:
+
+```
+GET http://10.44.44.10:8088/v2/foo/bar/manifests/latest?ns=gcr.io
+Host: 10.44.44.10:8088
+```
+
+The `Host:` header is the mirror's host (not the original registry's),
+**but the original registry is encoded in the `ns=` query parameter**
+(`resolver.go:591-598`, gated by `registry.go:85-91` so it's only added
+when mirror host ≠ upstream host).
+
+This is what makes HAProxy able to route to the correct per-upstream
+cache backend in mirror mode: ACL on `urlp(ns)`. Without `ns=` we'd
+have no way to tell a `docker.io` pull from a `gcr.io` pull once both
+arrive at `localhost:8088`. See §10 for the HAProxy ACL set.
+
+#### 11.1.3 Tier 1: dedicated cache instances per upstream
+
+We run dedicated Distribution / Zot / nginx instances for the **five
+most common public OCI registries** we expect to see in real
+Dockerfiles:
+
+| `ns` value          | upstream URL                | rationale                                       |
+|---------------------|-----------------------------|-------------------------------------------------|
+| `docker.io`         | `https://registry-1.docker.io` | Default; the vast majority of `FROM x` lines    |
+| `gcr.io`            | `https://gcr.io`            | Legacy Google images; still very common         |
+| `ghcr.io`           | `https://ghcr.io`           | GitHub-hosted projects; rapidly growing share   |
+| `quay.io`           | `https://quay.io`           | Red Hat / CoreOS ecosystem; many CNCF images    |
+| `registry.k8s.io`   | `https://registry.k8s.io`   | All Kubernetes control-plane images since 2023  |
+
+Each cache VM runs one process per (cache type × Tier-1 upstream) =
+**15 cache processes per cache VM**: 5 Distribution proxies, 5 Zot
+instances, 5 nginx vhosts. Port allocation (final layout in
+`constants.nix`):
+
+| port band      | cache type            |
+|----------------|-----------------------|
+| `5000`–`5004`  | Distribution proxies (one per Tier-1 upstream, indexed by upstream) |
+| `5050`–`5054`  | Zot instances         |
+| `8080`–`8084`  | nginx vhosts (Option 1 redirect-following config from §9.3) |
+| `8085`         | nginx wildcard catch-all (see §11.1.5) |
+| `8090`         | nginx Hugging Face vhost (HTTP, not OCI) |
+
+The `constants.nix.upstreams` table grows to enumerate the five Tier-1
+upstreams, and `cacheBackends` is generated programmatically by
+`lib.mapAttrs` from it. Adding a sixth upstream is "add one entry in
+`constants.nix` and `nix run .#cache-render`".
+
+#### 11.1.4 Per-registry `hosts.toml` files
+
+Generated by Nix into each client VM's `/etc/containerd/certs.d/`.
+The file for `docker.io` (other Tier 1 upstreams are identical with
+the upstream URL and HAProxy port swapped):
+
+```toml
+# /etc/containerd/certs.d/docker.io/hosts.toml
+server = "https://registry-1.docker.io"
+
+[host."http://127.0.0.1:8088"]
+  capabilities = ["pull", "resolve"]
+  # No TLS knobs needed; explicit http:// scheme is enough.
+  # Verified: hosts.go:430-449 keeps the scheme as-is when explicit.
+```
+
+Notes:
+
+- `server = "https://registry-1.docker.io"` is the **final fallback**
+  containerd uses if every mirror entry above it fails. Containerd's
+  silent-fallthrough semantics (`resolver.go:329 continue`) means a
+  dead cache never breaks a pull — it just degrades to direct upstream.
+- `capabilities = ["pull", "resolve"]` matches what mirrors are good
+  at; `push` and `referrers` correctly stay on the upstream
+  (`hosts.go:453-470`, `registry.go:28-44`).
+- The `http://` scheme **must** be explicit — without it,
+  containerd tries HTTPS first and falls back to HTTP only on certain
+  errors, with an unhelpful warning (`hosts.go:221-227`).
+- Containerd handles the `docker.io` → `registry-1.docker.io` rewrite
+  internally (`hosts.go:102-104`), so we use the friendly directory
+  name `docker.io/`.
+
+#### 11.1.5 The `_default` wildcard with a dynamic nginx catch-all
+
+Tier 1 covers the common cases. For anything else
+(`mcr.microsoft.com`, `public.ecr.aws`, `nvcr.io`,
+`registry.gitlab.com`, `registry.redhat.io`, …) we use containerd's
+`_default` wildcard pointed at a **dynamic nginx instance** on
+`:8085`. The trick: nginx reads the `ns=` query parameter and uses it
+as the `proxy_pass` upstream, so one nginx vhost serves an unbounded
+number of upstream registries:
+
+```toml
+# /etc/containerd/certs.d/_default/hosts.toml
+server = ""   # let the implicit upstream (the original registry) be the fallback
+
+[host."http://127.0.0.1:8085"]
+  capabilities = ["pull", "resolve"]
+```
+
+```nginx
+# nix/modules/nginx-cache.nix — wildcard catch-all on :8085
+proxy_cache_path /var/lib/cache/nginx/default
+                 levels=1:2 keys_zone=cache_default:100m
+                 max_size=200g inactive=30d use_temp_path=off;
+
+server {
+    listen 8085;
+    resolver 1.1.1.1 ipv6=off valid=300s;
+
+    location / {
+        # ns= is supplied by containerd (resolver.go:591-598). Without
+        # it we have no upstream to dispatch to → let the pull fall
+        # through to direct upstream.
+        set $ns $arg_ns;
+        if ($ns = "") { return 404; }
+
+        proxy_pass https://$ns;
+        proxy_ssl_server_name on;
+
+        proxy_cache cache_default;
+        # Key by (upstream, request URI). Strips ns= and any other
+        # query args — the digest is in $uri.
+        proxy_cache_key "$ns:$request_method:$uri";
+        proxy_cache_valid 200 30d;
+        proxy_cache_lock on;
+
+        # Same Option-1 redirect-following pattern as §9.3 for CDN 307s
+        proxy_intercept_errors on;
+        recursive_error_pages on;
+        error_page 301 302 303 307 308 = @follow_cdn;
+    }
+
+    location @follow_cdn {
+        set $cdn_url $upstream_http_location;
+        proxy_pass $cdn_url;
+        proxy_cache cache_default;
+        # Cache key is the ORIGINAL (ns, uri) pair — signed CDN query
+        # params on the upstream URL are excluded
+        proxy_cache_key "$arg_ns:blob:$uri";
+        proxy_cache_valid 200 30d;
+        proxy_cache_lock on;
+    }
 }
 ```
 
-- The single `registry-mirrors` entry is the *currently selected* cache
-  for the `docker.io` namespace — you change this one line to swap caches
-  (see §10.2).
-- The `insecure-registries` list is the **full menu** of HTTP endpoints
-  the daemon is allowed to talk to. Listing all of them up front means
-  swapping `registry-mirrors` doesn't require any other daemon edit, and
-  also unlocks explicit-tag pulls for the `gcr.io` and Hugging Face cases
-  where `registry-mirrors` doesn't help (see below).
+This single vhost catches any registry containerd encounters. A pull
+of `mcr.microsoft.com/dotnet/runtime:9.0` becomes
+`http://127.0.0.1:8085/v2/dotnet/runtime/manifests/9.0?ns=mcr.microsoft.com`
+→ nginx → `https://mcr.microsoft.com/v2/dotnet/runtime/manifests/9.0`,
+cached under key `mcr.microsoft.com:GET:/v2/dotnet/runtime/manifests/9.0`.
 
-> **TLS alternative.** If we later want to drop `insecure-registries`,
-> generate a self-signed CA in `secrets/`, mint a cert with all seven
-> `*.local` SANs, deploy it on HAProxy, and add the CA to
-> `/etc/docker/certs.d/<host>:<port>/ca.crt` on each client. This is
-> mechanically identical to the `certs/` pattern in `nix-k8s-examples`
-> and `ceph-on-k8s`. For v1 we accept the simpler HTTP-only setup since
-> the bridge is private.
+If a wildcard pull *fails* at our cache (returns 404 or 5xx),
+containerd's silent fallthrough sends the pull direct to the real
+upstream and the user's `FROM` line still works. **The user never
+sees a difference; the cache is best-effort.**
 
-### 11.2 Switching the cache under test
+#### 11.1.6 Switching the cache type under test
 
-`registry-mirrors` only ever affects `docker.io`, so the main switching
-story is: *which cache backend handles the `docker.io` workload?*
+Each cache type lives on a different HAProxy frontend port on each
+client:
 
-We make this a one-token change. `daemon.json` is templated from
-`/etc/cache-experiment/active-mirror`:
+| HAProxy port | cache type   | backend pools (one per Tier-1 upstream + wildcard) |
+|--------------|--------------|----------------------------------------------------|
+| `8088`       | Distribution | `be_dist_docker`, `be_dist_gcr`, `be_dist_ghcr`, `be_dist_quay`, `be_dist_k8s`, `be_dist_default` (which redirects unknown `ns=` to the nginx wildcard) |
+| `8089`       | Zot          | `be_zot_*` — same structure                        |
+| `8090`       | nginx (OCI)  | `be_ngx_*` — same structure                        |
 
-```
-# /etc/cache-experiment/active-mirror
-registry-docker.local
-```
+Switching = a `cache-set-mirror` flake app that rewrites every
+per-Tier-1 `hosts.toml` to point at the new port, then `systemctl
+reload containerd`:
 
-A flake app `cache-set-mirror` swaps the file, regenerates
-`daemon.json`, and runs `systemctl reload docker`:
-
-```
-nix run .#cache-set-mirror -- --client=client0 --backend=zot-docker
-nix run .#cache-set-mirror -- --client=client0 --backend=nginx-docker
-nix run .#cache-set-mirror -- --client=client0 --backend=distribution-docker
+```bash
+nix run .#cache-set-mirror -- --client=client0 --cache=zot
+# → rewrites /etc/containerd/certs.d/{docker.io,gcr.io,ghcr.io,quay.io,registry.k8s.io}/hosts.toml
+#   to point at http://127.0.0.1:8089, then systemctl reload containerd
 ```
 
-Internally that just rewrites the file to `zot-docker.local`,
-`nginx-docker.local`, or `registry-docker.local` respectively — all of
-which resolve to `127.0.0.1` via the `/etc/hosts` entries baked into the
-client VMs by `nix/modules/docker-client.nix`. HAProxy then sees the
-matching Host header and routes to the corresponding backend pool.
+containerd's hot-reload of `hosts.toml` is in-process (no restart);
+in-flight pulls finish on the old cache, new pulls hit the new cache.
+The `_default/hosts.toml` always points at the nginx wildcard on
+`:8085`, so unknown registries are always cacheable regardless of
+which OCI cache type is the Tier 1 target.
 
-For **gcr.io** and **Hugging Face**, `registry-mirrors` doesn't help (it
-only covers `docker.io`). You exercise those caches with explicit pulls:
+### 11.2 Mode 2: HTTPS MITM via HAProxy (see §12)
 
+The trust-breaking alternative. Detailed in §12. Use when Mode 1 is
+unavailable (e.g. dockerd is pinned to the graphdriver image store, or
+the containerd image puller is bypassed by some downstream tooling),
+or to compare cache hit rates under MITM vs hosts.toml for the same
+workload.
+
+### 11.3 Mode 3: legacy `daemon.json` registry-mirrors (comparison baseline)
+
+Kept around so we can benchmark legacy-mode pulls side-by-side with
+Mode 1. **Do not use as the primary client config** — it only mirrors
+`docker.io`, so any `FROM gcr.io/...` or `FROM ghcr.io/...` in a user
+Dockerfile silently bypasses the cache.
+
+How it works (recap of the two relevant `daemon.json` keys):
+
+- **`registry-mirrors`** — list of URLs dockerd consults *before*
+  Docker Hub for anything in the `docker.io` namespace. Tried in list
+  order; falls back to Docker Hub if no mirror responds. **Applies
+  only to `docker.io`.**
+- **`insecure-registries`** — list of `host[:port]` entries where
+  dockerd is allowed to speak plain HTTP or skip TLS verification.
+  Pure trust relaxation; not a routing directive.
+
+For HTTP-only HAProxy on the experiment bridge, you need both:
+
+```json
+{
+  "registry-mirrors": ["http://127.0.0.1:8088"],
+  "insecure-registries": ["127.0.0.1:8088"]
+}
 ```
-docker pull registry-gcr.local:8088/google-containers/pause:3.9
-curl  http://nginx-huggingface.local:8088/bert-base-uncased/resolve/main/pytorch_model.bin
-```
 
-This is intentionally manual — those are not the primary workload, but
-the harness supports them.
+The same `cache-set-mirror` flake app from §11.1.6 can re-target this
+to a different HAProxy port (`8089` for Zot, `8090` for nginx) when
+running Mode 3 benchmarks.
+
+> Why we keep this at all: the same cache topology can be exercised
+> via two different client-side mechanisms, which lets us isolate
+> "what is the *protocol* cost of containerd vs dockerd-distribution
+> pulls" from "what is the *cache implementation* cost". Without Mode
+> 3 we'd be measuring both at once.
 
 ---
 
 ## 12. Alternative: transparent HTTPS MITM via HAProxy (full-control mode)
 
-The design in §10–§11 routes traffic through HAProxy by *configuring*
-dockerd (`registry-mirrors` + `insecure-registries`). It works, but it
-inherits two limitations of dockerd's mirror plumbing:
+This is **Mode 2** from the table in §11. It exists as an alternative
+to Mode 1 (containerd `hosts.toml`, §11.1) and as the only viable
+path when Mode 1 is unavailable.
 
-1. `registry-mirrors` covers **only `docker.io`**. Pulls of
-   `gcr.io/foo/bar` skip the mirror entirely and go direct to upstream.
-2. Hugging Face downloads aren't OCI pulls at all, so dockerd's mirror
-   config doesn't help them either.
+**When Mode 1 already works (most cases), prefer Mode 1.** It is
+strictly simpler — no PKI to maintain, no DNS poisoning, no broken
+TLS trust — and covers the same set of registries. Mode 2 is the
+right choice when:
 
-This section explores a stronger alternative: **transparent HTTPS
-interception** at HAProxy, where dockerd makes vanilla HTTPS calls and
-HAProxy terminates the TLS on the fly using certs we minted. With our
-own CA installed in the client trust store, **every** upstream pull
-(docker.io, gcr.io, anything) is intercepted with no per-namespace
-client config — and HAProxy gets to see the decrypted URI for
-consistent hashing. The user has explicitly signed off on breaking the
-HTTPS end-to-end guarantee because the host, both VMs, and both CAs
-are all under our control.
+- dockerd is configured with the legacy graphdriver image store (so
+  `hosts.toml` isn't consulted) — e.g. userns remapping forces this
+  per
+  [`daemon/command/daemon_linux.go:30-40`](../../moby/daemon/command/daemon_linux.go).
+- Some downstream tooling bypasses containerd's resolver entirely
+  (rare, but observed in some BuildKit configurations).
+- You want a comparison benchmark of "interception at the network
+  layer" vs "interception at the protocol layer".
+
+The architecture below stands on its own and shares all the same
+cache-side infrastructure (Distribution, Zot, nginx, HAProxy
+backends) as Mode 1 and Mode 3 — only the HAProxy frontend changes.
 
 ### 12.1 Why a vanilla HTTPS_PROXY doesn't help
 
@@ -1146,13 +1380,13 @@ secrets/
     ├── root-ca.crt                         # self-signed, 10y validity
     ├── intermediate.key                    # for day-to-day signing (kept around for rotation)
     ├── intermediate.crt                    # signed by root-ca, 5y validity
-    └── upstream/                           # one cert per upstream FQDN
-        ├── registry-1.docker.io.crt
-        ├── registry-1.docker.io.key
-        ├── gcr.io.crt
-        ├── gcr.io.key
-        ├── huggingface.co.crt
-        ├── huggingface.co.key
+    └── upstream/                           # one cert per Tier-1 upstream FQDN
+        ├── registry-1.docker.io.{crt,key}  # docker.io
+        ├── gcr.io.{crt,key}
+        ├── ghcr.io.{crt,key}
+        ├── quay.io.{crt,key}
+        ├── registry.k8s.io.{crt,key}
+        ├── huggingface.co.{crt,key}
         └── cdn-lfs.huggingface.co.{crt,key}
 ```
 
@@ -1187,8 +1421,13 @@ In `nix/microvm-client.nix`:
 ```nix
 networking.hosts = {
   "10.44.44.10" = [
+    # Tier-1 OCI registries (§11.1.3)
     "registry-1.docker.io"
     "gcr.io"
+    "ghcr.io"
+    "quay.io"
+    "registry.k8s.io"
+    # Hugging Face (non-OCI)
     "huggingface.co"
     "cdn-lfs.huggingface.co"
   ];
@@ -1196,6 +1435,13 @@ networking.hosts = {
   #       (the local HAProxy listens on the client's own address)
 };
 ```
+
+Any registry **not** in this poison list (e.g. `mcr.microsoft.com`,
+`public.ecr.aws`) goes direct to upstream from the client in Mode 2.
+Mode 1 catches those via the `_default` wildcard (§11.1.5); Mode 2
+doesn't have an equivalent because we can't MITM a host without a
+cert for it. The §15 future-work item on Route A (squid SSL bumping)
+would close this gap with dynamic cert minting.
 
 **Critically, the auth hosts and CDN hosts are NOT poisoned:**
 
@@ -1233,23 +1479,32 @@ frontend mitm
     # balance uri whole + consistent hashing as the registry-mirrors
     # path in §10 — HAProxy now sees the decrypted URI, so the hash
     # input is exactly /v2/<name>/blobs/sha256:<digest>.
-    acl sni_docker_io  ssl_fc_sni -i registry-1.docker.io
-    acl sni_gcr_io     ssl_fc_sni -i gcr.io
+    # SNI ACLs for the Tier-1 OCI registries (§11.1.3) plus HF
+    acl sni_docker     ssl_fc_sni -i registry-1.docker.io
+    acl sni_gcr        ssl_fc_sni -i gcr.io
+    acl sni_ghcr       ssl_fc_sni -i ghcr.io
+    acl sni_quay       ssl_fc_sni -i quay.io
+    acl sni_k8s        ssl_fc_sni -i registry.k8s.io
     acl sni_hf         ssl_fc_sni -i huggingface.co
     acl sni_hf_lfs     ssl_fc_sni -i cdn-lfs.huggingface.co
 
-    use_backend be_oci_docker if sni_docker_io
-    use_backend be_oci_gcr    if sni_gcr_io
-    use_backend be_hf         if sni_hf
-    use_backend be_hf_lfs     if sni_hf_lfs
+    # Reuses the SAME backend pools as Mode 1 (§10) — be_dist_*, be_zot_*,
+    # be_ngx_*. Which cache type those resolve to is controlled by the
+    # per-cache MITM listener address (§12.7), not by SNI.
+    use_backend be_dist_docker if sni_docker
+    use_backend be_dist_gcr    if sni_gcr
+    use_backend be_dist_ghcr   if sni_ghcr
+    use_backend be_dist_quay   if sni_quay
+    use_backend be_dist_k8s    if sni_k8s
+    use_backend be_ngx_huggingface if sni_hf or sni_hf_lfs
 
-# crt-list /etc/haproxy/upstream-certs.list contains:
-#   /var/lib/haproxy/certs/registry-1.docker.io.pem
-#   /var/lib/haproxy/certs/gcr.io.pem
-#   /var/lib/haproxy/certs/huggingface.co.pem
-#   /var/lib/haproxy/certs/cdn-lfs.huggingface.co.pem
-# Each .pem is the per-FQDN cert concatenated with its private key
-# (HAProxy's combined PEM format).
+    # Anything else (registry we forgot to mint a cert for) → wildcard
+    default_backend be_ngx_default
+
+# crt-list /etc/haproxy/upstream-certs.list contains one combined PEM
+# per Tier-1 OCI FQDN + the two HF FQDNs (7 entries). The exact list
+# is generated by `cache-gen-ca` from constants.ociUpstreams +
+# constants.httpUpstreams; see §12.3.
 ```
 
 The backends are exactly the same backends already defined in §10 —
@@ -1260,8 +1515,10 @@ internally.
 
 ### 12.7 Switching between caches in MITM mode
 
-The Host-header switching trick from §11.2 doesn't work here, because
-the SNI is fixed to the upstream FQDN. Two options:
+The per-cache-type frontend ports trick from §11.1.6 doesn't work
+directly here, because the client is connecting to `:443` on the
+poisoned FQDN — there is no port number for `cache-set-mirror` to
+flip. Two options:
 
 **(a) Per-cache MITM listen addresses.** Bind HAProxy on three
 loopback aliases: `127.0.0.10` for Distribution, `127.0.0.11` for
@@ -1327,17 +1584,39 @@ Mirrors the apps exposed by `nix-k8s-examples`/`ceph-on-k8s`:
 nix run .#cache-check-host             # verify tun, vhost-net, bridge support, sudo
 sudo nix run .#cache-network-setup     # create cachebr0 + 4 TAPs + NAT
 
-# offline secret generation (ssh keys only for this project)
+# offline secret generation (ssh keys; also CA + per-FQDN MITM certs for §12)
 nix run .#cache-gen-secrets
+nix run .#cache-gen-ca                 # only needed if you plan to use Mode 2
 
 # bring everything up
 nix run .#cache-start-all              # build + boot all 4 microvms
 
-# pick the cache under test on a client
-nix run .#cache-set-mirror -- --client=client0 --backend=zot-docker
+# ── pick the client-side mode and cache under test ───────────────────────
+# Mode 1 (primary): containerd hosts.toml
+nix run .#cache-set-mode   -- --client=client0 --mode=hosts-toml
+nix run .#cache-set-mirror -- --client=client0 --cache=zot   # one of: distribution, zot, nginx
+# → rewrites /etc/containerd/certs.d/{docker.io,gcr.io,ghcr.io,quay.io,
+#   registry.k8s.io}/hosts.toml to point at the new HAProxy port,
+#   then `systemctl reload containerd` (in-process hot reload).
 
-# pull something through the chosen cache
-nix run .#cache-vm-ssh -- --node=client0 -- "docker pull alpine && docker pull nginx"
+# Mode 2 (alt, MITM):
+nix run .#cache-set-mode   -- --client=client0 --mode=mitm
+nix run .#cache-set-mirror -- --client=client0 --cache=zot   # repoints the
+# /etc/hosts MITM loopback alias to the right per-cache listener (§12.7)
+
+# Mode 3 (legacy, comparison only):
+nix run .#cache-set-mode   -- --client=client0 --mode=registry-mirrors
+nix run .#cache-set-mirror -- --client=client0 --cache=zot   # rewrites daemon.json
+# only mirrors docker.io; other registries bypass the lab — for benchmarks only
+
+# ── exercise the chosen mode ─────────────────────────────────────────────
+nix run .#cache-vm-ssh -- --node=client0 -- "docker pull alpine"               # docker.io
+nix run .#cache-vm-ssh -- --node=client0 -- "docker pull gcr.io/distroless/static-debian12"
+nix run .#cache-vm-ssh -- --node=client0 -- "docker pull ghcr.io/astral-sh/uv:latest"
+nix run .#cache-vm-ssh -- --node=client0 -- "docker pull registry.k8s.io/pause:3.10"
+nix run .#cache-vm-ssh -- --node=client0 -- "docker pull quay.io/prometheus/prometheus:latest"
+nix run .#cache-vm-ssh -- --node=client0 -- "docker pull mcr.microsoft.com/dotnet/runtime:9.0"
+# ↑ the mcr.microsoft.com pull exercises the _default nginx wildcard (§11.1.5)
 
 # watch what HAProxy is doing
 nix run .#cache-vm-ssh -- --node=client0 -- "curl -s localhost:8404/stats\;csv"
@@ -1351,10 +1630,11 @@ Additional helpers we will add:
 
 - `cache-vm-wipe` — delete all `*-data.img` for a cold run.
 - `cache-render` — render every config file (HAProxy, Distribution, Zot,
-  nginx, `daemon.json` template) into `rendered/` so we can `git diff`
-  expected output without booting a VM.
+  nginx vhosts, `hosts.toml` per Tier-1 registry, `daemon.json`
+  template for Mode 3) into `rendered/` so we can `git diff` expected
+  output without booting a VM.
 - `cache-pull-corpus` — run a fixed list of pulls from a client; useful
-  for repeatable warm/cold cache measurements.
+  for repeatable warm/cold cache measurements across all three modes.
 
 ---
 
@@ -1363,21 +1643,23 @@ Additional helpers we will add:
 A few decisions in this doc are reasonable defaults but worth poking at
 before implementing:
 
-1. **Host-header routing on a single HAProxy port** vs **one HAProxy port
-   per cache type**. Host-header routing keeps a clean single bind and
-   makes "switch caches" a one-string change. The downside is that
-   experiments that mix two caches concurrently (e.g. half-traffic to
-   Zot, half to Distribution) require two daemons or two clients. If
-   that turns out to be a common need, we move to one port per cache.
+1. **One HAProxy frontend port per cache type** (current design) vs
+   **single port with internal switching.** We landed on per-port
+   because it makes the "currently active cache" visible to
+   `containerd config dump` and HAProxy stats simultaneously, with no
+   global mutex. Downside: experiments that mix two cache types
+   concurrently (e.g. half-traffic Zot, half Distribution) need two
+   clients. If that becomes a common need we add a runtime-switching
+   HAProxy variant.
 
-2. **Path-prefix routing (`/r/`, `/z/`, `/n/`) instead of Host headers.**
-   This was your original suggestion. We chose Host headers because
-   Docker's `registry-mirrors` historically keeps only scheme+host from
-   the URL and appends `/v2/...` itself, which means a configured
-   `http://localhost:8088/r` is likely to become
-   `http://localhost:8088/v2/...` in flight (no `/r/` prefix to ACL on).
-   If we find a moby release where path prefixes survive, switching to
-   path ACLs is a small HAProxy edit + a one-line `daemon.json` change.
+2. **`urlp(ns)` ACL relies on containerd always appending `ns=`.**
+   Confirmed in source ([`resolver.go:591-598`](../../containerd/core/remotes/docker/resolver.go); gated by
+   `registry.go:85-91`). For the `docker.io` → `registry-1.docker.io`
+   special case the gate fires only when the mirror host differs from
+   `registry-1.docker.io` — which it always does in our setup (mirror
+   is `localhost:8088`). The fallback in HAProxy is
+   `default_backend be_ngx_default` so a missing `ns=` doesn't
+   black-hole.
 
 3. **Two Zot instances vs one with multiple sync registries.** One
    instance per upstream is symmetric with Distribution; one instance
@@ -1447,6 +1729,49 @@ before implementing:
     re-mint every per-FQDN cert from the existing intermediate and
     hot-reload HAProxy. Validate before we end up wedged at expiry.
 
+13. **containerd-snapshotter is actually active on our client VMs.**
+    Mode 1 is silently a no-op if dockerd ends up on the graphdriver
+    image store. Check on each client boot:
+    ```bash
+    docker info --format '{{.DriverStatus}}'   # expect "io.containerd.snapshotter.v1.overlayfs" or similar
+    docker info --format '{{json .ContainerdCommit.ID}}'
+    ```
+    The `nix/modules/docker-client.nix` module should fail the build
+    if `virtualisation.docker.daemon.settings.features` ever sets
+    `containerd-snapshotter = false`, and a startup oneshot on
+    `client0`/`client1` should `journalctl --grep` for the
+    "containerd-snapshotter is now the default" warning as positive
+    confirmation.
+
+14. **Mode 1 falls back to upstream on cache failure, not on cache
+    misroute.** containerd's silent fallthrough
+    ([`resolver.go:287-349`](../../containerd/core/remotes/docker/resolver.go)) only triggers on connection
+    errors and select HTTP statuses on non-final mirrors. If a
+    misconfigured cache returns a *200 with wrong content* (e.g. a
+    Distribution proxy hardcoded for `docker.io` happily serves a
+    request meant for `gcr.io` because we routed wrong), containerd
+    will accept and store the wrong image. Mitigation: the HAProxy
+    `urlp(ns)` ACL must never send a request to a backend hardcoded
+    for a different upstream. Validate by sending a deliberately
+    misrouted request in CI and checking that the backend returns
+    404, not 200.
+
+15. **Wildcard catch-all coverage.** The `_default/hosts.toml`
+    nginx-wildcard path is the *only* mechanism that caches Tier-2
+    registries (mcr.microsoft.com, public.ecr.aws, etc.). Validate
+    that a `docker pull mcr.microsoft.com/dotnet/runtime:9.0`:
+    (a) actually goes through the wildcard nginx (not direct
+    upstream), (b) leaves a cache entry on disk on the cache VM, and
+    (c) a second pull from the *other* client gets a cache hit
+    despite consistent hashing.
+
+16. **Tier 1 list growth.** Today: 5 upstreams. Six months from now
+    when `quay.io` migration to `quay-prod.io` lands, or some new
+    common registry pops up in user Dockerfiles, the Tier 1 list
+    grows. Validate that adding a sixth upstream is one entry in
+    `constants.nix.ociUpstreams` + `nix run .#cache-render` + redeploy
+    — no manual port plumbing, no hand-written HAProxy ACLs.
+
 ---
 
 ## 15. Future work
@@ -1481,3 +1806,14 @@ before implementing:
 - **Wildcard DNS poisoning via `dnsmasq`** on the client VMs, replacing
   the static `networking.hosts` list in §12.5. Useful if any of our
   upstreams move to a wildcard-CDN pattern like `*.cdn-lfs.huggingface.co`.
+- **Zot as the `_default` wildcard cache** instead of nginx. Zot's
+  sync extension supports a list of upstream registries; if it also
+  honors the containerd `ns=` query parameter for dynamic dispatch
+  (worth verifying with a small spike), we could move the catch-all
+  from nginx to an OCI-aware cache. Cleaner protocol semantics, but
+  loses the "any HTTP upstream" flexibility nginx has.
+- **Tier-2 promotion path.** Currently anything outside Tier 1 lives
+  on the nginx wildcard. If telemetry shows a specific Tier-2
+  registry (e.g. `nvcr.io`, `public.ecr.aws`) becomes a hot path,
+  promote it to Tier 1 with its own Distribution/Zot/nginx
+  instances. Promotion = `constants.nix` edit + redeploy.
