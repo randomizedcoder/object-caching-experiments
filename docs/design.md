@@ -105,9 +105,18 @@ hostname, port, and resource size.
     5. [Implementation: the `cache-ca-injector` runc prestart hook](#135-implementation-the-cache-ca-injector-runc-prestart-hook)
     6. [What this does and doesn't catch](#136-what-this-does-and-doesnt-catch)
     7. [Trade-offs and risk](#137-trade-offs-and-risk)
-14. [Build and run workflow](#14-build-and-run-workflow)
-15. [Design choices to validate](#15-design-choices-to-validate)
-16. [Future work](#16-future-work)
+14. [Ubuntu client VMs (real-world test rigs)](#14-ubuntu-client-vms-real-world-test-rigs)
+    1. [Five clients total](#141-five-clients-total)
+    2. [Network attachment](#142-network-attachment)
+    3. [Per-version Vagrant box pinning](#143-per-version-vagrant-box-pinning)
+    4. [`constants.nix` additions](#144-constantsnix-additions)
+    5. [Ansible role layout](#145-ansible-role-layout)
+    6. [What's different vs the NixOS microvm clients](#146-whats-different-vs-the-nixos-microvm-clients)
+    7. [Build / run workflow additions](#147-build--run-workflow-additions)
+    8. [Trade-offs and risk](#148-trade-offs-and-risk)
+15. [Build and run workflow](#15-build-and-run-workflow)
+16. [Design choices to validate](#16-design-choices-to-validate)
+17. [Future work](#17-future-work)
 
 ---
 
@@ -223,12 +232,20 @@ so all three labs can run on the same host concurrently.
 
 Per-VM addresses, MACs and TAPs (defined once in `nix/constants.nix`):
 
-| VM        | TAP            | IPv4           | IPv6                | MAC                  |
-|-----------|----------------|----------------|---------------------|----------------------|
-| `client0` | `cachetap0`    | `10.44.44.10`  | `fd44:44:44::10`    | `02:00:0a:2c:2c:10`  |
-| `client1` | `cachetap1`    | `10.44.44.11`  | `fd44:44:44::11`    | `02:00:0a:2c:2c:11`  |
-| `cache0`  | `cachetap2`    | `10.44.44.20`  | `fd44:44:44::20`    | `02:00:0a:2c:2c:20`  |
-| `cache1`  | `cachetap3`    | `10.44.44.21`  | `fd44:44:44::21`    | `02:00:0a:2c:2c:21`  |
+| VM           | attach          | IPv4           | IPv6                | MAC                  |
+|--------------|-----------------|----------------|---------------------|----------------------|
+| `client0`    | `cachetap0` (microvm) | `10.44.44.10`  | `fd44:44:44::10`    | `02:00:0a:2c:2c:10`  |
+| `client1`    | `cachetap1` (microvm) | `10.44.44.11`  | `fd44:44:44::11`    | `02:00:0a:2c:2c:11`  |
+| `cache0`     | `cachetap2` (microvm) | `10.44.44.20`  | `fd44:44:44::20`    | `02:00:0a:2c:2c:20`  |
+| `cache1`     | `cachetap3` (microvm) | `10.44.44.21`  | `fd44:44:44::21`    | `02:00:0a:2c:2c:21`  |
+| `ubuntu2204` | bridge (Vagrant libvirt `:public_network, :dev => "cachebr0"`) | `10.44.44.30` | `fd44:44:44::30` | `02:00:0a:2c:2c:30` |
+| `ubuntu2404` | bridge (Vagrant libvirt) | `10.44.44.31` | `fd44:44:44::31` | `02:00:0a:2c:2c:31` |
+| `ubuntu2604` | bridge (Vagrant libvirt) | `10.44.44.32` | `fd44:44:44::32` | `02:00:0a:2c:2c:32` |
+
+The NixOS microvms use per-VM TAPs created on the host
+(§14.2 below). The Ubuntu VMs use Vagrant's libvirt provider to
+attach directly to `cachebr0` — no per-VM TAP needed on the host
+side because libvirt manages the attachment itself.
 
 Host setup (run once per boot via `sudo nix run .#cache-network-setup`):
 
@@ -2026,7 +2043,253 @@ nftables rule correctness under restart).
 
 ---
 
-## 14. Build and run workflow
+## 14. Ubuntu client VMs (real-world test rigs)
+
+Everything in §8 (microvm definitions) and §11 (per-registry mirroring)
+is exercised today through two NixOS microvm clients — perfect for
+testing the *cache mechanism* itself (HAProxy ACLs, `hosts.toml`
+templating, the runc CA hook), but not representative of how real
+users actually run Docker. This section adds three **Ubuntu Vagrant
+VMs** alongside the NixOS clients to test:
+
+- The real-world apt path (sources.list / apt-cacher-ng / GPG-signed
+  packages) end-to-end against §13's caching layer.
+- The two common ways people install Docker on Ubuntu and whether
+  both yield a containerd-snapshotter image store that respects our
+  `hosts.toml`.
+- Per-Ubuntu-version drift (cgroup v1 vs v2, deb822 vs traditional
+  sources.list, AppArmor profile changes, ca-certificates layout).
+
+The provisioning patterns are lifted from
+[`runpod/ansible-host`](../../runpod/ansible-host) — same `mkBox`
+generator, same per-version structure, same Ansible role layout. We
+do not need to reinvent any of that.
+
+### 14.1 Five clients total
+
+The topology in §5 grows from 4 to 7 microvms / VMs total:
+
+| VM            | OS              | IP            | Role                                                 |
+|---------------|-----------------|---------------|------------------------------------------------------|
+| `client0`     | NixOS microvm   | `10.44.44.10` | Cache-mechanism test rig (existing)                  |
+| `client1`     | NixOS microvm   | `10.44.44.11` | Cache-mechanism test rig (existing)                  |
+| **`ubuntu2204`** | **Ubuntu 22.04 Vagrant**  | **`10.44.44.30`** | **Real-world rig with `docker.io` (distro Docker)** |
+| **`ubuntu2404`** | **Ubuntu 24.04 Vagrant**  | **`10.44.44.31`** | **Real-world rig with `docker-ce` (download.docker.com)** |
+| **`ubuntu2604`** | **Ubuntu 26.04 Vagrant**  | **`10.44.44.32`** | **Real-world rig with `docker-ce` (download.docker.com)** |
+| `cache0`      | NixOS microvm   | `10.44.44.20` | Cache backends (existing)                            |
+| `cache1`      | NixOS microvm   | `10.44.44.21` | Cache backends (existing)                            |
+
+The Docker install split (`docker.io` on 22.04 vs `docker-ce` on
+24.04/26.04) is intentional — Ubuntu's distro-packaged `docker.io`
+ships an older Docker bundle with different defaults for the
+containerd snapshotter integration, and we want to measure both
+paths.
+
+### 14.2 Network attachment
+
+All three Ubuntu VMs join the existing `cachebr0` bridge with static
+IPs, so they can hit `10.44.44.10` / `10.44.44.11` (their local
+HAProxy is on *themselves*, but they can also point at a NixOS
+client's HAProxy for cross-client measurements) and the cache VMs at
+`10.44.44.20-21` natively. No second subnet, no inter-bridge NAT.
+
+Vagrant's libvirt provider attaches via `:public_network` with the
+`:dev => "cachebr0"` knob, plus a static IP set in the libvirt
+network XML:
+
+```ruby
+# Generated from constants.nix.ubuntuClients
+config.vm.network "public_network",
+  dev: "cachebr0",
+  mode: "bridge",
+  type: "bridge",
+  ip: "10.44.44.30",
+  netmask: "255.255.255.0",
+  mac: "02:00:0a:2c:2c:30"
+
+# Disable Vagrant's NFS synced_folder (we don't need it; avoids
+# pulling in nfs-server on the host)
+config.vm.synced_folder ".", "/vagrant", disabled: true
+```
+
+The bridge already has IP forwarding and nftables masquerade from
+§5; Ubuntu VMs get the same outbound NAT path as the NixOS clients.
+
+### 14.3 Per-version Vagrant box pinning
+
+Copied verbatim in shape from
+[`runpod/ansible-host/nix/targets/ubuntu-boxes.nix:33-59`](../../runpod/ansible-host/nix/targets/ubuntu-boxes.nix).
+One `mkBox` function consumed by three entries:
+
+```nix
+# nix/ubuntu-boxes.nix
+{ pkgs, lib }:
+let
+  mkBox = { ubuntuVersion, source, urlVersion, sha256 }: rec {
+    inherit ubuntuVersion source urlVersion;
+    dotted = let v = ubuntuVersion;
+             in "${builtins.substring 0 2 v}.${builtins.substring 2 2 v}";
+    boxName = "object-caching-experiments-${source}-ubuntu-${ubuntuVersion}";
+    url =
+      if source == "bento" then
+        "https://vagrantcloud.com/bento/boxes/ubuntu-${dotted}/versions/${urlVersion}/providers/libvirt/amd64/vagrant.box"
+      else  # cloud-image (pre-GA releases like 26.04 today)
+        "https://vagrantcloud.com/cloud-image/boxes/ubuntu-${dotted}/versions/${urlVersion}/providers/libvirt/amd64/vagrant.box";
+    box = pkgs.fetchurl { inherit url sha256; };
+  };
+in {
+  "2204" = mkBox { ubuntuVersion = "2204"; source = "bento";
+                   urlVersion = "202502.21.0";
+                   sha256 = "1db70l5bcrnrs9sxq2rlldq7kb4lhcxw1qscg6lmlxz6fyv57dl2"; };
+  "2404" = mkBox { ubuntuVersion = "2404"; source = "bento";
+                   urlVersion = "202508.03.0";
+                   sha256 = "1pazin59p565bvx85r4parfwfrgn0iggdfrzfqw98clp6a8ij1nh"; };
+  "2604" = mkBox { ubuntuVersion = "2604"; source = "cloud-image";
+                   urlVersion = "20260421.0.0";
+                   sha256 = "0jzcg72ii492si4rr88ayrjkm0xkvpf9c47anbwfj3qfr0m88fab"; };
+}
+```
+
+The 22.04 and 24.04 sha256s above are the same values already pinned
+in runpod's `ubuntu-boxes.nix`. The 26.04 hash and `urlVersion` are
+pinned to the current `cloud-image` release; updating it is one nix
+edit + a `nix flake check`.
+
+### 14.4 `constants.nix` additions
+
+```nix
+# nix/constants.nix — appended; full file otherwise unchanged
+ubuntuClients = {
+  ubuntu2204 = {
+    version     = "2204";    versionDot  = "22.04";
+    ip4         = "10.44.44.30";
+    ip6         = "fd44:44:44::30";
+    mac         = "02:00:0a:2c:2c:30";
+    boxSource   = "bento";   boxVersion  = "202502.21.0";
+    dockerPkg   = "docker.io";   # Ubuntu repo path
+  };
+  ubuntu2404 = {
+    version     = "2404";    versionDot  = "24.04";
+    ip4         = "10.44.44.31";
+    ip6         = "fd44:44:44::31";
+    mac         = "02:00:0a:2c:2c:31";
+    boxSource   = "bento";   boxVersion  = "202508.03.0";
+    dockerPkg   = "docker-ce";   # download.docker.com path
+  };
+  ubuntu2604 = {
+    version     = "2604";    versionDot  = "26.04";
+    ip4         = "10.44.44.32";
+    ip6         = "fd44:44:44::32";
+    mac         = "02:00:0a:2c:2c:32";
+    boxSource   = "cloud-image"; boxVersion = "20260421.0.0";
+    dockerPkg   = "docker-ce";
+  };
+};
+
+# VM sizing for Ubuntu — slightly larger than NixOS microvms because
+# Vagrant boxes carry the full distro plus systemd plus snapd
+ubuntuResources = { vcpus = 4; memoryMB = 4096; dataDiskGB = 20; };
+```
+
+### 14.5 Ansible role layout
+
+The Ansible directory mirrors runpod's structure
+(`ansible/roles/<group>/<concern>/tasks/main.yml`). Four roles
+covered:
+
+| Role                                      | Source                                                          | Applies to        |
+|-------------------------------------------|-----------------------------------------------------------------|-------------------|
+| `system/docker/install` (docker-ce)       | Lifted from [`runpod/ansible-host/ansible/roles/system/docker/install/tasks/main.yml`](../../runpod/ansible-host/ansible/roles/system/docker/install/tasks/main.yml) verbatim — apt-key + repo + `docker-ce` + `containerd.io` | ubuntu2404, ubuntu2604 |
+| `system/docker/install-distro` (docker.io) | **new** — single `apt install docker.io` task; verifies containerd snapshotter status via `docker info` | ubuntu2204        |
+| `system/cache/ca-trust`                   | **new** — installs our CA from `secrets/ca/root-ca.crt` into `/usr/local/share/ca-certificates/cache-experiments.crt` and runs `update-ca-certificates` | all three         |
+| `system/cache/containerd-mirrors`         | **new** — templates one `/etc/containerd/certs.d/<reg>/hosts.toml` per Tier-1 upstream (from `constants.nix.ociUpstreams`) plus the `_default` wildcard, then `systemctl restart containerd` | all three         |
+| `system/cache/apt-proxy` *(optional)*     | **new** — `/etc/apt/apt.conf.d/00cache-proxy` pointing at the per-client HAProxy on port 3142 (explicit Mode-3 fallback for apt; the §13 iptables REDIRECT is the transparent default) | all three         |
+
+The `ca-trust` role is what makes the §12 MITM and §13 OS-package
+MITM both functional from these Ubuntu VMs: same CA file, two
+different consumers.
+
+### 14.6 What's different vs the NixOS microvm clients
+
+| Concern                | NixOS microvm                                | Ubuntu Vagrant                                         |
+|------------------------|----------------------------------------------|--------------------------------------------------------|
+| Provisioning           | Declarative `nixosSystem { modules = ... }`  | Bento/cloud-image .box → `vagrant up` → Ansible        |
+| Re-provision turnaround| Rebuild + restart (~30s)                     | `vagrant destroy && vagrant up && ansible-playbook` (~90s) |
+| Persistent state       | `*-data.img` (microvm volumes)               | qcow2 overlay under `/var/lib/libvirt/images/`         |
+| Trust-store insertion  | `security.pki.certificateFiles` (build-time) | Ansible `system/cache/ca-trust` role (run-time)        |
+| `containerd-snapshotter` default | guaranteed (NixOS dockerd module pins it) | needs verification per Docker version on each release  |
+| apt sources.list format| n/a                                          | 22.04 = traditional `/etc/apt/sources.list`; 24.04+ = deb822 `/etc/apt/sources.list.d/ubuntu.sources` |
+| cgroup version         | v2 (NixOS default)                           | 22.04 = v1+v2 hybrid; 24.04+ = v2 — the §13 nftables `cgroupv2 path` rule needs both for full coverage |
+
+The cgroup difference is the most operationally interesting: the
+nftables rule from §13.3 (`socket cgroupv2 level 2 ...`) matches on
+the v2 unified hierarchy. On 22.04 with `systemd.unified_cgroup_hierarchy=1`
+in the kernel cmdline it works; without it, dockerd's cgroup is v1
+and the rule misses. Our `system/cache/containerd-mirrors` role
+will set the kernel cmdline as needed.
+
+### 14.7 Build / run workflow additions
+
+```bash
+# One-time per Ubuntu version: download + register the Vagrant box
+nix run .#ubuntu-box-add -- --version=2404
+
+# Per-VM lifecycle
+nix run .#ubuntu-vm-start -- --version=2404     # vagrant up; cloud-init runs; box boots
+nix run .#ubuntu-vm-ssh   -- --version=2404     # wraps `vagrant ssh` with the right working dir
+nix run .#ubuntu-vm-stop  -- --version=2404
+nix run .#ubuntu-vm-wipe  -- --version=2404     # vagrant destroy + remove qcow2
+
+# Apply our Ansible playbook (Docker + CA + containerd mirrors)
+nix run .#ubuntu-ansible-apply -- --version=2404 --play=setup
+
+# Bring up all three at once
+nix run .#ubuntu-start-all
+
+# Verify the cache plumbing is wired up
+nix run .#ubuntu-vm-ssh -- --version=2404 -- \
+    "docker info | grep -i snapshotter && \
+     cat /etc/containerd/certs.d/docker.io/hosts.toml && \
+     curl -sI https://gcr.io/v2/ | head -3"
+```
+
+These compose with the existing `cache-start-all` / `cache-set-mode`
+/ `cache-set-mirror` workflow — the Ubuntu VMs see the same caches
+on the same bridge, just with different OS-side packaging glue.
+
+### 14.8 Trade-offs and risk
+
+- **Vagrant + libvirt is a new dependency on the host.** Today the
+  flake needs `microvm.nix` + qemu; this adds `vagrant`,
+  `vagrant-libvirt`, `libvirt-daemon-system`, and (transitively)
+  `dnsmasq`, `ebtables`. All of these are NixOS modules; the
+  `cache-check-host` app gains five new prerequisite checks.
+- **Static-IP bridged networking via Vagrant is finicky.** The
+  `:public_network` + `:dev` combo requires the host bridge to
+  already exist (it does — §5 brings up `cachebr0`) and Vagrant's
+  user not to be inside the `libvirtd` group implicitly granting
+  too much. We'll explicitly assign group membership in
+  `cache-check-host`.
+- **The 26.04 hash is currently a pre-GA pin.** It will rotate
+  when 26.04 ships final. Treat the `cloud-image` source as
+  best-effort and document the version-bump command in
+  `docs/runbook-ubuntu.md` (a follow-up).
+- **No measurement isolation between NixOS and Ubuntu clients.**
+  They share `cachebr0`, so a runaway pull on `ubuntu2604` will
+  contend with one on `client0`. Acceptable for an experiment lab;
+  not for production benchmarking. The §16 future-work item on
+  separate measurement bridges addresses this.
+- **Ansible needs to be reachable from outside the VM.** The simplest
+  story is "Ansible runs on the host, targets Ubuntu VMs over SSH via
+  the `cachebr0` bridge". The `nix run .#ubuntu-ansible-apply` app
+  generates a one-shot inventory from `constants.nix.ubuntuClients`
+  and `exec`s `ansible-playbook`, mirroring the
+  [`mk-vagrant-test.nix`](../../runpod/ansible-host/nix/lib/mk-vagrant-test.nix:164-199)
+  approach.
+
+---
+
+## 15. Build and run workflow
 
 Mirrors the apps exposed by `nix-k8s-examples`/`ceph-on-k8s`:
 
@@ -2040,7 +2303,8 @@ nix run .#cache-gen-secrets
 nix run .#cache-gen-ca                 # only needed if you plan to use Mode 2
 
 # bring everything up
-nix run .#cache-start-all              # build + boot all 4 microvms
+nix run .#cache-start-all              # build + boot the 4 NixOS microvms (client0/1, cache0/1)
+nix run .#ubuntu-start-all             # vagrant up the 3 Ubuntu VMs (2204/2404/2604) and apply Ansible
 
 # ── pick the client-side mode and cache under test ───────────────────────
 # Mode 1 (primary): containerd hosts.toml
@@ -2069,11 +2333,22 @@ nix run .#cache-vm-ssh -- --node=client0 -- "docker pull quay.io/prometheus/prom
 nix run .#cache-vm-ssh -- --node=client0 -- "docker pull mcr.microsoft.com/dotnet/runtime:9.0"
 # ↑ the mcr.microsoft.com pull exercises the _default nginx wildcard (§11.1.5)
 
+# the same workload from an Ubuntu client — proves the unmodified-Dockerfile
+# constraint holds end-to-end on a real-world distro
+nix run .#ubuntu-vm-ssh -- --version=2404 -- "docker pull alpine"
+nix run .#ubuntu-vm-ssh -- --version=2404 -- "docker pull gcr.io/distroless/static-debian12"
+nix run .#ubuntu-vm-ssh -- --version=2204 -- "docker pull quay.io/prometheus/prometheus:latest"
+
+# exercise the §13 OS-package cache too — should hit apt-cacher-ng on cache0/cache1
+nix run .#ubuntu-vm-ssh -- --version=2404 -- \
+    "docker run --rm debian:bookworm bash -c 'apt update && apt install -y curl'"
+
 # watch what HAProxy is doing
 nix run .#cache-vm-ssh -- --node=client0 -- "curl -s localhost:8404/stats\;csv"
 
 # tear down
 nix run .#cache-vm-stop
+nix run .#ubuntu-vm-stop-all
 sudo nix run .#cache-network-teardown
 ```
 
@@ -2089,7 +2364,7 @@ Additional helpers we will add:
 
 ---
 
-## 15. Design choices to validate
+## 16. Design choices to validate
 
 A few decisions in this doc are reasonable defaults but worth poking at
 before implementing:
@@ -2223,9 +2498,48 @@ before implementing:
     `constants.nix.ociUpstreams` + `nix run .#cache-render` + redeploy
     — no manual port plumbing, no hand-written HAProxy ACLs.
 
+17. **Ubuntu 22.04 + `docker.io` actually uses the containerd image
+    store.** The §11 design assumes `hosts.toml` will be honoured.
+    With `docker-ce` on 24.04 / 26.04 that's a default. With Ubuntu's
+    distro-packaged `docker.io`, the version is older and the
+    containerd-snapshotter default may or may not be set. The
+    `system/docker/install-distro` role must check `docker info`
+    after install and fail loudly if the snapshotter is not
+    `io.containerd.snapshotter.v1.overlayfs` (or similar). If it
+    isn't, Mode 1 silently falls back to legacy graphdriver and the
+    cache is bypassed — exactly the kind of footgun the §13
+    runc-CA-hook validation also covers.
+
+18. **Vagrant libvirt `:public_network` bridged to `cachebr0` is
+    actually wired correctly.** Easy to misconfigure: the VM gets a
+    DHCP lease instead of the static IP, or the MAC mismatches and
+    nftables rules don't match, or the bridge isn't in promiscuous
+    mode for non-VM destinations. Bring-up validation:
+    `ip neigh show dev cachebr0` after `vagrant up` should show the
+    static MAC mapped to the static IP, and pings from `client0` to
+    `ubuntu2404` should succeed before Ansible touches anything.
+
+19. **cgroup v1 → v2 on Ubuntu 22.04.** §13.3's nftables rule keys
+    on the unified cgroup v2 hierarchy. Some kernels on 22.04 still
+    default to the hybrid hierarchy where dockerd's cgroup is v1 →
+    the redirect rule silently misses → containers escape the OS
+    package cache. The `system/cache/containerd-mirrors` role should
+    set `systemd.unified_cgroup_hierarchy=1` in the kernel cmdline
+    on 22.04 and reboot once if needed. Validate by counting
+    matched packets on the nftables redirect rule after a single
+    `apt update` inside a container.
+
+20. **Per-VM Ansible runs are idempotent.** The roles in §14.5
+    should be re-runnable without breaking anything; in particular
+    `system/cache/ca-trust` should not duplicate the CA on each run
+    and `system/cache/containerd-mirrors` should not append duplicate
+    entries to `hosts.toml` files. Validate via two consecutive
+    `ubuntu-ansible-apply` runs and a `git diff` (effectively `diff`
+    of `/etc/containerd/certs.d/` against rendered).
+
 ---
 
-## 16. Future work
+## 17. Future work
 
 - **Workload generator.** A reproducible pull corpus (top-50 docker.io
   images, a fixed set of gcr.io k8s images, a couple of HF models) so we
@@ -2268,3 +2582,22 @@ before implementing:
   registry (e.g. `nvcr.io`, `public.ecr.aws`) becomes a hot path,
   promote it to Tier 1 with its own Distribution/Zot/nginx
   instances. Promotion = `constants.nix` edit + redeploy.
+- **More Ubuntu (and other distro) test rigs.** v1 covers
+  `docker.io` on 22.04 and `docker-ce` on 24.04 / 26.04. Worth
+  adding: Ubuntu 24.04 with `docker.io` (same release, different
+  package) for an isolated docker.io-vs-docker-ce comparison;
+  RHEL/Fedora/Rocky to test `dnf` interception and the runc CA hook
+  on `subscription-manager`-managed trust stores; Alpine to test
+  the `apk` cache path against nginx-generic.
+- **Per-version measurement bridges.** Today all clients (NixOS +
+  Ubuntu) share `cachebr0`. A runaway pull on one client contends
+  with another. Splitting NixOS clients onto `cachebr0` and Ubuntu
+  clients onto `cachebr1` (with NAT between them to the cache VMs)
+  would isolate measurement runs at the network layer. Cheap to
+  add, useful when we start putting numbers on this.
+- **Convert the NixOS clients to use the runpod-style Ansible
+  layout** so the Ansible roles in §14.5 work on both NixOS and
+  Ubuntu uniformly. NixOS-via-Ansible is unusual but supported
+  (`raw` + `community.general.nixos_*` modules). Lower priority —
+  the current NixOS declarative path is fine — but would let us
+  retire some duplicated config logic.
