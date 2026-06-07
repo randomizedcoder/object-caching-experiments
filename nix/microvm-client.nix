@@ -18,6 +18,16 @@ let
   mac          = constants.network.macs.${nodeName};
   tap          = constants.network.taps.${nodeName};
 
+  # Per-FQDN leaf certs this client's nginx :443 loads (§14.2/§14.3). One
+  # per mitmCertGroups entry, signed by this client's own MITM CA. Empty
+  # until cache-gen-ca has run (mitm == null).
+  mitmLeaves = if mitm == null then [] else
+    map (g: {
+      name = g.name;
+      crt  = mitm.mitmDir + "/${g.name}.crt";
+      key  = mitm.mitmDir + "/${g.name}.key";
+    }) constants.mitmCertGroups;
+
   vmConfig = nixpkgs.lib.nixosSystem {
     inherit system;
     modules = [
@@ -26,6 +36,7 @@ let
       ./modules/observability.nix
       ./modules/nginx-client.nix
       ./modules/docker-client.nix
+      ./modules/mitm.nix
       ({ config, pkgs, ... }: {
         system.stateVersion  = "26.05";
         nixpkgs.hostPlatform = system;
@@ -105,6 +116,23 @@ let
           install -d -m 0755 /etc/nginx
           install -m 0644 ${cacheCa} /etc/nginx/cache-ca.crt
         '';
+
+        # ── per-client MITM CA + leaves (Phase 3, §14.2/§14.4) ─────────
+        # Trust THIS client's own root CA so the local nginx :443 can
+        # impersonate the model-store origins without TLS errors. Distinct
+        # from the cache CA above (that one only authenticates the cache).
+        security.pki.certificateFiles = lib.optional (mitm != null) mitm.ca;
+
+        # Install the per-FQDN leaf crt/key nginx loads per SNI server{}.
+        # 0600 root-owned keys: the nginx master reads them at startup as
+        # root before workers drop to the nginx user.
+        system.activationScripts.mitm-leaves =
+          lib.optionalString (mitm != null) (''
+            install -d -m 0750 /etc/nginx/mitm
+          '' + lib.concatMapStringsSep "\n" (l: ''
+            install -m 0644 ${l.crt} /etc/nginx/mitm/${l.name}.crt
+            install -m 0600 ${l.key} /etc/nginx/mitm/${l.name}.key
+          '') mitmLeaves);
 
         networking.firewall.enable = false;   # trusted lab subnet
       })
