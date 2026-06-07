@@ -97,6 +97,13 @@ in
       # One dedicated User-Agent on every upstream request (§11.1).
       proxy_set_header User-Agent "${c.userAgent}";
 
+      # Match the cache VMs' roomier proxy header buffers: big-header origins
+      # (github) relayed through the cache would otherwise overflow the default
+      # 4k/8k here too and 502 at the client hop.
+      proxy_buffer_size       16k;
+      proxy_buffers         8 16k;
+      proxy_busy_buffers_size 32k;
+
       # ── local hot tiers (small on purpose, §5 Req#3) ──────────────────
       proxy_cache_path /var/lib/cache/nginx/oci levels=1:2 keys_zone=oci_hot:64m
                        max_size=8g inactive=24h use_temp_path=off;

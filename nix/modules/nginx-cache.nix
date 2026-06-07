@@ -177,6 +177,13 @@ in
       proxy_ignore_headers Cache-Control Set-Cookie Expires X-Accel-Expires Vary;
       proxy_hide_header Set-Cookie;
 
+      # Big-header origins (github.com sends a large cookie/CSP block) overflow
+      # the default 4k/8k proxy header buffer → "upstream sent too big header"
+      # → 502. Roomier buffers fix it for every model/extra/oci vhost at once.
+      proxy_buffer_size       16k;
+      proxy_buffers         8 16k;
+      proxy_busy_buffers_size 32k;
+
       # Pull the digest out of /blobs/sha256:<hex> so identical blobs dedup
       # to a single entry across every repo and namespace (§7.2).
       map $uri $blob_digest { ~/blobs/(?<d>sha256:[0-9a-f]+)$ $d; default ""; }
