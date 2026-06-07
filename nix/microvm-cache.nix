@@ -25,6 +25,7 @@ let
       ./modules/sysctls.nix
       ./modules/observability.nix
       ./modules/nginx-cache.nix
+      ./modules/zot-oracle.nix
       ({ config, pkgs, ... }: {
         system.stateVersion  = "26.05";
         nixpkgs.hostPlatform = system;

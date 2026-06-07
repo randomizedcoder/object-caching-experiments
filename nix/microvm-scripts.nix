@@ -179,6 +179,126 @@ in
     '';
   };
 
+  # ── Phase 2e: three-way correctness gate (§7.4, §20.5) ────────────────
+  # Pull a fixed corpus three ways and compare the manifest content digest:
+  #   • upstream   → the real origin registry  (ground truth for a transparent cache)
+  #   • nginx      → cache VM :8085 (TLS, ?ns=<reg>)  — the hand-written rules
+  #   • Zot oracle → cache VM :<zotPort>              — spec cross-check
+  #
+  # GATE: nginx MUST byte-match upstream (same Docker-Content-Digest). That is
+  # the transparency property — the cache serves exactly what the origin serves.
+  # Zot agreement is reported but NOT a gate: Zot re-serialises docker-media
+  # manifests to OCI on ingest, so its digest only matches for OCI-native
+  # upstreams. A "zot diverges" line on a docker-media image is EXPECTED, not a
+  # bug — nginx (pass-through) is the more faithful cache there.
+  diffTest = pkgs.writeShellApplication {
+    name = "cache-diff-test";
+    runtimeInputs = with pkgs; [ curl coreutils gnugrep gnused gawk jq ];
+    text = let
+      cacheIp    = constants.network.ipv4.${builtins.head constants.cacheNames};
+      serverName = constants.cacheTls.serverName;
+      nginxPort  = toString constants.ports.nginxWildcard;
+      upstreamCases = builtins.concatStringsSep "\n          " (pkgs.lib.mapAttrsToList
+        (ns: u: "${ns}) echo ${u.url} ;;") constants.upstreams);
+      accept = builtins.concatStringsSep "," [
+        "application/vnd.oci.image.index.v1+json"
+        "application/vnd.oci.image.manifest.v1+json"
+        "application/vnd.docker.distribution.manifest.list.v2+json"
+        "application/vnd.docker.distribution.manifest.v2+json"
+      ];
+    in ''
+      set -uo pipefail
+
+      CA="''${PWD}/secrets/cache/ca/cache-CA.crt"
+      if [[ ! -f "$CA" ]]; then
+        echo "ERROR: $CA not found. Run 'nix run .#cache-gen-ca' first." >&2
+        exit 1
+      fi
+
+      # reg|repo|tag|zotPort
+      corpus=(
+        "registry.k8s.io|pause|3.9|5054"
+        "registry.k8s.io|coredns/coredns|v1.11.1|5054"
+        "gcr.io|distroless/static|latest|5051"
+      )
+
+      # ns → real upstream base URL (from constants.upstreams).
+      upstream_url() {
+        case "$1" in
+          ${upstreamCases}
+          *) echo "" ;;
+        esac
+      }
+
+      # Parse "<status> <digest>" out of an HTTP header dump on stdin.
+      parse_hdrs() {
+        awk 'BEGIN{IGNORECASE=1; s="000"; d="-"}
+             /^HTTP\//{s=$2}
+             /^Docker-Content-Digest:/{d=$2; sub(/\r/,"",d)}
+             END{print s, d}'
+      }
+
+      # Probe a cache backend. $1=url $2..=extra curl args → "<status> <digest>".
+      probe() {
+        local url="$1"; shift
+        curl -sS -o /dev/null -D - -H "Accept: ${accept}" "$@" "$url" 2>/dev/null | parse_hdrs
+      }
+
+      # Probe the real origin, following a Bearer-token challenge if issued.
+      probe_upstream() {
+        local reg="$1" repo="$2" tag="$3" base url hdrs status wa realm svc scope tok
+        base="$(upstream_url "$reg")"
+        [[ -z "$base" ]] && { echo "000 -"; return; }
+        url="$base/v2/$repo/manifests/$tag"
+        hdrs="$(curl -sSL -o /dev/null -D - -H "Accept: ${accept}" "$url" 2>/dev/null)"
+        status="$(awk 'BEGIN{IGNORECASE=1}/^HTTP\//{s=$2}END{print s}' <<<"$hdrs")"
+        if [[ "$status" == "401" ]]; then
+          wa="$(grep -i '^Www-Authenticate:' <<<"$hdrs" | head -1)"
+          realm="$(sed -n 's/.*realm="\([^"]*\)".*/\1/p'   <<<"$wa")"
+          svc="$(sed -n 's/.*service="\([^"]*\)".*/\1/p'    <<<"$wa")"
+          scope="$(sed -n 's/.*scope="\([^"]*\)".*/\1/p'    <<<"$wa")"
+          tok="$(curl -sS "$realm?service=$svc&scope=$scope" 2>/dev/null \
+                 | jq -r '.token // .access_token // empty')"
+          hdrs="$(curl -sSL -o /dev/null -D - -H "Accept: ${accept}" \
+                  -H "Authorization: Bearer $tok" "$url" 2>/dev/null)"
+        fi
+        parse_hdrs <<<"$hdrs"
+      }
+
+      pass=0; fail=0
+      for entry in "''${corpus[@]}"; do
+        IFS='|' read -r reg repo tag zotPort <<<"$entry"
+        echo "── ''${reg}/''${repo}:''${tag} ──"
+
+        read -r us ud < <(probe_upstream "''${reg}" "''${repo}" "''${tag}")
+        read -r ns nd < <(probe \
+          "https://${serverName}:${nginxPort}/v2/''${repo}/manifests/''${tag}?ns=''${reg}" \
+          --cacert "$CA" --resolve "${serverName}:${nginxPort}:${cacheIp}")
+        read -r zs zd < <(probe \
+          "http://${cacheIp}:''${zotPort}/v2/''${repo}/manifests/''${tag}")
+
+        echo "   upstream: status=$us digest=$ud"
+        echo "   nginx   : status=$ns digest=$nd"
+        echo "   zot     : status=$zs digest=$zd"
+
+        if [[ "$us" == "200" && "$ns" == "200" && "$ud" == "$nd" && "$ud" != "-" ]]; then
+          echo "   PASS (nginx matches upstream)"; pass=$((pass+1))
+        else
+          echo "   FAIL (nginx diverges from upstream)"; fail=$((fail+1))
+        fi
+        if [[ "$zd" == "$ud" && "$zd" != "-" ]]; then
+          echo "   note: zot agrees"
+        else
+          echo "   note: zot diverges (OCI re-serialisation — expected for docker-media upstreams)"
+        fi
+      done
+
+      echo ""
+      echo "=== diff-test: $pass passed, $fail failed (gate = nginx vs upstream) ==="
+      [[ "$fail" -eq 0 ]]
+    '';
+  };
+
   wipe = pkgs.writeShellApplication {
     name = "cache-vm-wipe";
     runtimeInputs = with pkgs; [ procps coreutils ];
