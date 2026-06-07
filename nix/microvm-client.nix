@@ -24,6 +24,7 @@ let
       microvm.nixosModules.microvm
       ./modules/sysctls.nix
       ./modules/observability.nix
+      ./modules/nginx-client.nix
       ({ config, pkgs, ... }: {
         system.stateVersion  = "26.05";
         nixpkgs.hostPlatform = system;
