@@ -92,6 +92,7 @@ rec {
     clientMitm    = 443;    # §14 HTTPS termination (H3+H2)
     nginxWildcard = 8085;   # shared cache OCI catch-all (TLS, §11.5)
     nginxApt      = 8086;   # shared cache apt (TLS)
+    nginxExtra    = 8104;   # shared cache generic MITM-extra vhost (download.docker.com etc., §17)
     nodeExporter  = 9100;
     nginxExporter = 9113;
     nginxStatus   = 8099;   # localhost-only stub_status, scraped by nginxExporter (§19)

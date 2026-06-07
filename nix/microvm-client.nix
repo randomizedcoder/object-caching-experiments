@@ -124,14 +124,14 @@ let
         security.pki.certificateFiles = lib.optional (mitm != null) mitm.ca;
 
         # Install the per-FQDN leaf crt/key nginx loads per SNI server{}.
-        # 0600 root-owned keys: the nginx master reads them at startup as
-        # root before workers drop to the nginx user.
+        # Owned by nginx (the config-test pre-start reads keys as that user),
+        # mirroring the cache-tls install on the cache VMs.
         system.activationScripts.mitm-leaves =
           lib.optionalString (mitm != null) (''
-            install -d -m 0750 /etc/nginx/mitm
+            install -d -m 0755 /etc/nginx/mitm
           '' + lib.concatMapStringsSep "\n" (l: ''
-            install -m 0644 ${l.crt} /etc/nginx/mitm/${l.name}.crt
-            install -m 0600 ${l.key} /etc/nginx/mitm/${l.name}.key
+            install -o nginx -g nginx -m 0644 ${l.crt} /etc/nginx/mitm/${l.name}.crt
+            install -o nginx -g nginx -m 0600 ${l.key} /etc/nginx/mitm/${l.name}.key
           '') mitmLeaves);
 
         networking.firewall.enable = false;   # trusted lab subnet

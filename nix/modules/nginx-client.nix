@@ -30,6 +30,56 @@ let
     c.cacheNames);
 
   validStatuses = lib.concatStringsSep ", " (map toString hc.validStatuses);
+
+  # ── MITM :443 frontend (§14.3) ────────────────────────────────────────
+  # One consistent-hash upstream per cache-VM model vhost, plus a generic
+  # "extra" one for mitmExtraHosts. The client→cache hop is TLS verified
+  # against the cache CA (proxy_ssl_* set at http scope, inherited).
+  mkUp = uname: port: ''
+    upstream ${uname} {
+      hash $cache_key consistent;
+      ${lib.concatMapStringsSep "\n      " (n:
+        "server ${c.network.ipv4.${n}}:${toString port} max_fails=1 fail_timeout=10s;")
+        c.cacheNames}
+      keepalive 16;
+    }'';
+
+  modelUpstreams = lib.concatStringsSep "\n" (
+    (lib.mapAttrsToList (name: store: mkUp "shared_model_${name}" store.nginxPort) c.modelStores)
+    ++ [ (mkUp "shared_model_extra" c.ports.nginxExtra) ]);
+
+  # Group → its cache upstream: model stores route to their own vhost,
+  # everything else (mitmExtraHosts) to the generic extra vhost.
+  groupUpstream = g:
+    if builtins.hasAttr g.name c.modelStores
+    then "shared_model_${g.name}" else "shared_model_extra";
+
+  # One :443 server{} per mitmCertGroups entry. SNI selects the per-FQDN
+  # leaf cert (this client's own, §14.2); the decrypted request is sent on
+  # to the cache layer with the original FQDN in X-Orig-Host. H2 today;
+  # HTTP/3 is a tuning follow-up (§18.3).
+  mitmServers = lib.concatStringsSep "\n" (map (g: ''
+    server {
+      listen 443 ssl;
+      http2 on;
+      server_name ${lib.concatStringsSep " " g.fqdns};
+      ssl_certificate     /etc/nginx/mitm/${g.name}.crt;
+      ssl_certificate_key /etc/nginx/mitm/${g.name}.key;
+
+      proxy_cache oci_hot;                 # reuse the small local hot tier
+      location = /health { return 200 "ok\n"; }
+      location / {
+        set $cache_key "${g.name}:$host$uri";   # ketama peer selection
+        proxy_cache_key "${g.name}:$host$uri";  # local hot-tier dedup
+        proxy_set_header X-Orig-Host $host;      # original origin for the cache
+        proxy_set_header Host $host;
+        proxy_cache_valid 200 206 60d;
+        proxy_cache_lock on;
+        proxy_pass https://${groupUpstream g};
+        add_header X-Cache-Hot  $upstream_cache_status;
+        add_header X-Cache-Time $request_time;
+      }
+    }'') c.mitmCertGroups);
 in
 {
   services.nginx = {
@@ -78,6 +128,9 @@ in
         keepalive 16;
       }
 
+      # ── model-store + extra upstreams (cache VM model vhosts, §15) ─────
+      ${modelUpstreams}
+
       # ── in-process active health-check (§11.3) ────────────────────────
       lua_package_path ";;";
       lua_shared_dict healthcheck 1m;
@@ -109,6 +162,9 @@ in
           valid_statuses = { 200 },
         }
       }
+
+      # ── :443 MITM frontends (one server{} per cert group, §14.3) ──────
+      ${mitmServers}
     '';
 
     virtualHosts = {

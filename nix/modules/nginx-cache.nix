@@ -127,6 +127,20 @@ let
 
   modelVhosts = lib.mapAttrs' (name: store:
     lib.nameValuePair "model-${name}" (mkModelVhost name store)) c.modelStores;
+
+  # Generic MITM-extra vhost (§17): same origin-agnostic http template, keyed
+  # in its own cache_extra zone. Handles any X-Orig-Host (download.docker.com).
+  extraVhost = {
+    "mitm-extra" = {
+      listen = [{ addr = "0.0.0.0"; port = c.ports.nginxExtra; ssl = true; }];
+      extraConfig = ''
+        resolver 1.1.1.1 ipv6=off valid=300s;
+        ssl_certificate     /etc/nginx/cache/cache-server.crt;
+        ssl_certificate_key /etc/nginx/cache/cache-server.key;
+      '';
+      locations = httpLocations "extra";
+    };
+  };
 in
 {
   services.nginx = {
@@ -150,6 +164,11 @@ in
 
       # Per-model-store zones (HF/ModelScope/PyTorch/Ollama), §15.
       ${modelCachePaths}
+
+      # Generic zone for MITM'd HTTPS third-party repos (download.docker.com
+      # etc., §17) served by the :8104 extra vhost.
+      proxy_cache_path /var/lib/cache/nginx/extra levels=1:2
+        keys_zone=cache_extra:16m max_size=5g inactive=60d use_temp_path=off;
 
       # Origins/CDNs send Set-Cookie (Cloudflare __cf_bm) and Cache-Control
       # that would otherwise stop nginx caching; we deliberately override
@@ -288,7 +307,7 @@ in
           };
         };
       };
-    } // modelVhosts;
+    } // modelVhosts // extraVhost;
   };
 
   # Cache dirs on the data disk, owned by the nginx service user.
@@ -297,6 +316,7 @@ in
     "d /var/lib/cache/nginx 0750 nginx nginx - -"
     "d /var/lib/cache/nginx/default 0750 nginx nginx - -"
     "d /var/lib/cache/nginx/apt 0750 nginx nginx - -"
+    "d /var/lib/cache/nginx/extra 0750 nginx nginx - -"
   ] ++ modelTmpfiles;
 
   # The NixOS nginx unit runs under ProtectSystem=strict, which makes the

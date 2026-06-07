@@ -24,6 +24,6 @@ in
   # SNI server{}. Created up front so the activation can drop files in.
   systemd.tmpfiles.rules = [
     "d /etc/nginx 0755 root root - -"
-    "d /etc/nginx/mitm 0750 nginx nginx - -"
+    "d /etc/nginx/mitm 0755 nginx nginx - -"
   ];
 }
