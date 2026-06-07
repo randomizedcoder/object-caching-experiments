@@ -135,6 +135,50 @@ in
     '';
   };
 
+  # ── Phase 2b: push the cache CA public cert to every client ───────────
+  # Build-time activation already bakes the CA into each client image; this
+  # runtime push lets you rotate the cache CA (cache-gen-ca --force) and
+  # refresh clients WITHOUT a rebuild — scp the public cert into nginx's
+  # proxy_ssl_trusted_certificate path and reload. §11.5.
+  distributeTrust = pkgs.writeShellApplication {
+    name = "cache-distribute-trust";
+    runtimeInputs = with pkgs; [ openssh coreutils ];
+    text = ''
+      set -euo pipefail
+      unset SSH_AUTH_SOCK || true
+
+      CA="''${PWD}/secrets/cache/ca/cache-CA.crt"
+      KEY="''${PWD}/secrets/ssh-ed25519"
+      if [[ ! -f "$CA" ]]; then
+        echo "ERROR: $CA not found. Run 'nix run .#cache-gen-ca' first." >&2
+        exit 1
+      fi
+      if [[ ! -f "$KEY" ]]; then
+        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
+        exit 1
+      fi
+      ${if knownHosts == null then ''
+      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' first." >&2
+      exit 1
+      '' else ''
+      for spec in ${builtins.concatStringsSep " " (builtins.map
+        (n: "${n}:${constants.network.ipv4.${n}}") constants.clientNames)}; do
+        node="''${spec%%:*}"; ip="''${spec##*:}"
+        echo "[$node] pushing cache CA to root@$ip:/etc/nginx/cache-ca.crt"
+        scp -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${knownHosts} \
+            -o IdentitiesOnly=yes -i "$KEY" \
+            "$CA" "root@$ip:/etc/nginx/cache-ca.crt"
+        ssh -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${knownHosts} \
+            -o IdentitiesOnly=yes -i "$KEY" \
+            "root@$ip" 'systemctl reload nginx 2>/dev/null || true'
+      done
+      echo "Cache CA distributed to: ${builtins.concatStringsSep " " constants.clientNames}"
+      ''}
+    '';
+  };
+
   wipe = pkgs.writeShellApplication {
     name = "cache-vm-wipe";
     runtimeInputs = with pkgs; [ procps coreutils ];

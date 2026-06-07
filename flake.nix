@@ -67,6 +67,8 @@
             cache-network-setup    = mkApp net.setup      "cache-network-setup";
             cache-network-teardown = mkApp net.teardown   "cache-network-teardown";
             cache-gen-secrets      = mkApp secgen.secrets "cache-gen-secrets";
+            cache-gen-ca           = mkApp secgen.caGen   "cache-gen-ca";
+            cache-distribute-trust = mkApp vm.distributeTrust "cache-distribute-trust";
             cache-start-all        = mkApp vm.startAll    "cache-start-all";
             cache-vm-ssh           = mkApp vm.ssh         "cache-vm-ssh";
             cache-vm-stop          = mkApp vm.stop        "cache-vm-stop";

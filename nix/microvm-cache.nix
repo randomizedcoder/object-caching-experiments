@@ -24,6 +24,7 @@ let
       microvm.nixosModules.microvm
       ./modules/sysctls.nix
       ./modules/observability.nix
+      ./modules/nginx-cache.nix
       ({ config, pkgs, ... }: {
         system.stateVersion  = "26.05";
         nixpkgs.hostPlatform = system;
@@ -99,11 +100,17 @@ let
           ''}'';
 
         # ── shared cache server cert (Phase 2; no-op while null) ───────
-        system.activationScripts.cache-tls = lib.optionalString (cacheServer != null) ''
-          install -d -m 0755 /etc/nginx/cache
-          install -m 0644 ${cacheServer.crt} /etc/nginx/cache/cache-server.crt
-          install -m 0600 ${cacheServer.key} /etc/nginx/cache/cache-server.key
-        '';
+        # Owned by the nginx user: nginx-pre-start runs `nginx -t` as that
+        # user, so a root-only 0600 key fails the config test (Permission
+        # denied). deps=["users"] guarantees the nginx user exists first.
+        system.activationScripts.cache-tls = {
+          deps = [ "users" ];
+          text = lib.optionalString (cacheServer != null) ''
+            install -d -m 0755 /etc/nginx/cache
+            install -o nginx -g nginx -m 0644 ${cacheServer.crt} /etc/nginx/cache/cache-server.crt
+            install -o nginx -g nginx -m 0600 ${cacheServer.key} /etc/nginx/cache/cache-server.key
+          '';
+        };
 
         networking.firewall.enable = false;   # trusted lab subnet
       })

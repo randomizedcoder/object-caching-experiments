@@ -12,6 +12,14 @@ let
   nodeLines = builtins.concatStringsSep "\n" (builtins.map
     (n: "${constants.getHostname n} ${constants.network.ipv4.${n}}")
     nodes);
+
+  # SAN for the shared cache server cert: the stable serverName plus both
+  # cache VMs' IPv4+IPv6 (they present the SAME cert, so the consistent-hash
+  # upstream verifies one name regardless of which peer ketama picks). §11.5.
+  serverName = constants.cacheTls.serverName;
+  cacheSan = "DNS:${serverName}" + builtins.concatStringsSep "" (builtins.map
+    (n: ",IP:${constants.network.ipv4.${n}},IP:${constants.network.ipv6.${n}}")
+    constants.cacheNames);
 in
 {
   secrets = pkgs.writeShellApplication {
@@ -66,6 +74,72 @@ NODES
       echo "  user key : $DIR/ssh-ed25519(.pub)"
       echo "  host keys: $DIR/host-keys/"
       echo "  known_hosts: $DIR/known_hosts"
+    '';
+  };
+
+  # ── Phase 2b: the cache CA + one shared cache server cert (§11.5) ──────
+  # A dedicated lab-wide CA (separate from the per-client MITM CA) signs ONE
+  # server cert deployed to BOTH interchangeable cache VMs; every client
+  # trusts the CA and verifies (proxy_ssl_verify on). CA/server keys stay in
+  # secrets/ — only the public CA cert is SSH-pushed to clients.
+  caGen = pkgs.writeShellApplication {
+    name = "cache-gen-ca";
+    runtimeInputs = with pkgs; [ coreutils openssl git ];
+    text = ''
+      set -euo pipefail
+
+      DIR="''${PWD}/secrets/cache"
+      FORCE=0
+      for arg in "$@"; do
+        case "$arg" in
+          --force) FORCE=1 ;;
+          *) echo "unknown arg: $arg" >&2; exit 2 ;;
+        esac
+      done
+
+      if [ -e "$DIR" ] && [ "$FORCE" -ne 1 ]; then
+        echo "ERROR: $DIR already exists. Re-run with --force to overwrite." >&2
+        exit 1
+      fi
+      rm -rf "$DIR"
+      install -d -m 0700 "$DIR" "$DIR/ca" "$DIR/server"
+
+      # ── self-signed cache CA ──────────────────────────────────────────
+      openssl genrsa -out "$DIR/ca/cache-CA.key" 4096
+      chmod 600 "$DIR/ca/cache-CA.key"
+      openssl req -x509 -new -nodes -key "$DIR/ca/cache-CA.key" \
+        -sha256 -days 3650 -out "$DIR/ca/cache-CA.crt" \
+        -subj "/O=object-caching-experiments/CN=cache-CA"
+      chmod 644 "$DIR/ca/cache-CA.crt"
+
+      # ── shared server cert (SAN = serverName + both cache IPs) ─────────
+      openssl genrsa -out "$DIR/server/cache-server.key" 2048
+      chmod 600 "$DIR/server/cache-server.key"
+      openssl req -new -key "$DIR/server/cache-server.key" \
+        -out "$DIR/server/cache-server.csr" \
+        -subj "/O=object-caching-experiments/CN=${serverName}"
+      cat > "$DIR/server/cache-server.ext" <<'EXT'
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = ${cacheSan}
+EXT
+      openssl x509 -req -in "$DIR/server/cache-server.csr" \
+        -CA "$DIR/ca/cache-CA.crt" -CAkey "$DIR/ca/cache-CA.key" \
+        -CAcreateserial -sha256 -days 825 \
+        -extfile "$DIR/server/cache-server.ext" \
+        -out "$DIR/server/cache-server.crt"
+      chmod 644 "$DIR/server/cache-server.crt"
+      rm -f "$DIR/server/cache-server.csr" "$DIR/server/cache-server.ext"
+
+      # Make untracked files visible to the flake (pure-eval sees only
+      # tracked/intent-to-add paths).
+      git add --intent-to-add "$DIR" 2>/dev/null || true
+
+      echo "Cache CA + shared server cert written to $DIR"
+      echo "  CA cert : $DIR/ca/cache-CA.crt (public; SSH-pushed to clients)"
+      echo "  server  : $DIR/server/cache-server.{crt,key} (both cache VMs)"
+      echo "  SAN     : ${cacheSan}"
     '';
   };
 }
