@@ -23,11 +23,59 @@ let
     (n: "${n}) echo ${constants.getHostname n} ;;") allNodes);
 
   nodeListMsg = builtins.concatStringsSep " " allNodes;
+
+  # ── Phase 2b: push the cache CA public cert to every client ───────────
+  # Build-time activation already bakes the CA into each client image; this
+  # runtime push lets you rotate the cache CA (cache-gen-ca --force) and
+  # refresh clients WITHOUT a rebuild — scp the public cert into nginx's
+  # proxy_ssl_trusted_certificate path and reload. §11.5. Defined in `let`
+  # (not the attrset) so cache-start-all can call it after boot.
+  distributeTrust = pkgs.writeShellApplication {
+    name = "cache-distribute-trust";
+    runtimeInputs = with pkgs; [ openssh coreutils ];
+    text = ''
+      set -euo pipefail
+      unset SSH_AUTH_SOCK || true
+
+      CA="''${PWD}/secrets/cache/ca/cache-CA.crt"
+      KEY="''${PWD}/secrets/ssh-ed25519"
+      if [[ ! -f "$CA" ]]; then
+        echo "ERROR: $CA not found. Run 'nix run .#cache-gen-ca' first." >&2
+        exit 1
+      fi
+      if [[ ! -f "$KEY" ]]; then
+        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
+        exit 1
+      fi
+      ${if knownHosts == null then ''
+      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' first." >&2
+      exit 1
+      '' else ''
+      # shellcheck disable=SC2043  # list is Nix-generated; may be a single client
+      for spec in ${builtins.concatStringsSep " " (builtins.map
+        (n: "${n}:${constants.network.ipv4.${n}}") constants.clientNames)}; do
+        node="''${spec%%:*}"; ip="''${spec##*:}"
+        echo "[$node] pushing cache CA to root@$ip:/etc/nginx/cache-ca.crt"
+        scp -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${knownHosts} \
+            -o IdentitiesOnly=yes -i "$KEY" \
+            "$CA" "root@$ip:/etc/nginx/cache-ca.crt"
+        ssh -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${knownHosts} \
+            -o IdentitiesOnly=yes -i "$KEY" \
+            "root@$ip" 'systemctl reload nginx 2>/dev/null || true'
+      done
+      echo "Cache CA distributed to: ${builtins.concatStringsSep " " constants.clientNames}"
+      ''}
+    '';
+  };
 in
 {
+  inherit distributeTrust;
+
   startAll = pkgs.writeShellApplication {
     name = "cache-start-all";
-    runtimeInputs = with pkgs; [ nix procps coreutils ];
+    runtimeInputs = with pkgs; [ nix procps coreutils netcat-gnu ];
     text = ''
       set -euo pipefail
       echo "=== Booting cache lab (caches first, then client) ==="
@@ -46,7 +94,25 @@ in
       fi
       '') bootOrder)}
       echo ""
-      echo "All VMs launched. Check with: nix run .#cache-vm-ssh -- --node=cache0 -- uptime"
+      echo "All VMs launched."
+
+      # Best-effort: once the clients answer SSH, push the current cache CA
+      # (idempotent; the image already bakes it, this refreshes after a
+      # cache-gen-ca rotation). Never fails the boot.
+      if [[ -f "''${PWD}/secrets/cache/ca/cache-CA.crt" ]]; then
+        # shellcheck disable=SC2043  # list is Nix-generated; may be a single client
+        for ip in ${builtins.concatStringsSep " " (builtins.map
+          (n: constants.network.ipv4.${n}) constants.clientNames)}; do
+          for _ in $(seq 1 30); do
+            if nc -z -w1 "$ip" 22 2>/dev/null; then break; fi
+            sleep 2
+          done
+        done
+        echo "=== distributing cache CA to clients ==="
+        ${distributeTrust}/bin/cache-distribute-trust || \
+          echo "WARN: trust distribution failed (clients may still be booting)"
+      fi
+      echo "Check with: nix run .#cache-vm-ssh -- --node=cache0 -- uptime"
     '';
   };
 
@@ -132,50 +198,6 @@ in
       else
         echo "$NODE ($hostname) not running"
       fi
-    '';
-  };
-
-  # ── Phase 2b: push the cache CA public cert to every client ───────────
-  # Build-time activation already bakes the CA into each client image; this
-  # runtime push lets you rotate the cache CA (cache-gen-ca --force) and
-  # refresh clients WITHOUT a rebuild — scp the public cert into nginx's
-  # proxy_ssl_trusted_certificate path and reload. §11.5.
-  distributeTrust = pkgs.writeShellApplication {
-    name = "cache-distribute-trust";
-    runtimeInputs = with pkgs; [ openssh coreutils ];
-    text = ''
-      set -euo pipefail
-      unset SSH_AUTH_SOCK || true
-
-      CA="''${PWD}/secrets/cache/ca/cache-CA.crt"
-      KEY="''${PWD}/secrets/ssh-ed25519"
-      if [[ ! -f "$CA" ]]; then
-        echo "ERROR: $CA not found. Run 'nix run .#cache-gen-ca' first." >&2
-        exit 1
-      fi
-      if [[ ! -f "$KEY" ]]; then
-        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
-        exit 1
-      fi
-      ${if knownHosts == null then ''
-      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' first." >&2
-      exit 1
-      '' else ''
-      for spec in ${builtins.concatStringsSep " " (builtins.map
-        (n: "${n}:${constants.network.ipv4.${n}}") constants.clientNames)}; do
-        node="''${spec%%:*}"; ip="''${spec##*:}"
-        echo "[$node] pushing cache CA to root@$ip:/etc/nginx/cache-ca.crt"
-        scp -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=${knownHosts} \
-            -o IdentitiesOnly=yes -i "$KEY" \
-            "$CA" "root@$ip:/etc/nginx/cache-ca.crt"
-        ssh -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=${knownHosts} \
-            -o IdentitiesOnly=yes -i "$KEY" \
-            "root@$ip" 'systemctl reload nginx 2>/dev/null || true'
-      done
-      echo "Cache CA distributed to: ${builtins.concatStringsSep " " constants.clientNames}"
-      ''}
     '';
   };
 
@@ -296,6 +318,60 @@ in
       echo ""
       echo "=== diff-test: $pass passed, $fail failed (gate = nginx vs upstream) ==="
       [[ "$fail" -eq 0 ]]
+    '';
+  };
+
+  # ── Phase 2f: toggle the client's in-process active health-check (§11.3) ──
+  # Writes/removes /run/nginx-hc-disabled on each client and reloads nginx;
+  # the init_worker_by_lua_block kill-switch (nginx-client.nix) skips spawning
+  # the active probers when the flag is present. The PASSIVE backstop (upstream
+  # max_fails/fail_timeout) stays in force regardless — this only turns the
+  # active lua probing on/off, e.g. to A/B its effect or quiesce probe noise.
+  setHc = pkgs.writeShellApplication {
+    name = "cache-set-hc";
+    runtimeInputs = with pkgs; [ openssh coreutils ];
+    text = ''
+      set -euo pipefail
+      unset SSH_AUTH_SOCK || true
+
+      STATE=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --state=*) STATE="''${1#--state=}"; shift ;;
+          --) shift ;;
+          *) shift ;;
+        esac
+      done
+      if [[ "$STATE" != "on" && "$STATE" != "off" ]]; then
+        echo "usage: cache-set-hc -- --state=<on|off>" >&2
+        exit 2
+      fi
+
+      KEY="''${PWD}/secrets/ssh-ed25519"
+      if [[ ! -f "$KEY" ]]; then
+        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
+        exit 1
+      fi
+      ${if knownHosts == null then ''
+      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' first." >&2
+      exit 1
+      '' else ''
+      if [[ "$STATE" == "off" ]]; then
+        cmd='touch /run/nginx-hc-disabled && systemctl reload nginx'
+      else
+        cmd='rm -f /run/nginx-hc-disabled && systemctl reload nginx'
+      fi
+      # shellcheck disable=SC2043  # list is Nix-generated; may be a single client
+      for ip in ${builtins.concatStringsSep " " (builtins.map
+        (n: constants.network.ipv4.${n}) constants.clientNames)}; do
+        echo "[$ip] active health-check → $STATE"
+        ssh -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=${knownHosts} \
+            -o IdentitiesOnly=yes -i "$KEY" \
+            "root@$ip" "$cmd"
+      done
+      echo "Active health-check set $STATE on: ${builtins.concatStringsSep " " constants.clientNames}"
+      ''}
     '';
   };
 

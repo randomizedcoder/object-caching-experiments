@@ -94,6 +94,7 @@ rec {
     nginxApt      = 8086;   # shared cache apt (TLS)
     nodeExporter  = 9100;
     nginxExporter = 9113;
+    nginxStatus   = 8099;   # localhost-only stub_status, scraped by nginxExporter (§19)
   };
 
   # User-Agent the client nginx sends on every upstream request (§11.1).

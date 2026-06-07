@@ -70,6 +70,7 @@
             cache-gen-ca           = mkApp secgen.caGen   "cache-gen-ca";
             cache-distribute-trust = mkApp vm.distributeTrust "cache-distribute-trust";
             cache-diff-test        = mkApp vm.diffTest    "cache-diff-test";
+            cache-set-hc           = mkApp vm.setHc       "cache-set-hc";
             cache-start-all        = mkApp vm.startAll    "cache-start-all";
             cache-vm-ssh           = mkApp vm.ssh         "cache-vm-ssh";
             cache-vm-stop          = mkApp vm.stop        "cache-vm-stop";

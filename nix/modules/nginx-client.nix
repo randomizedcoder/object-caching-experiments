@@ -82,6 +82,12 @@ in
       lua_package_path ";;";
       lua_shared_dict healthcheck 1m;
       init_worker_by_lua_block {
+        -- Runtime kill-switch (§11.3): `cache-set-hc --state=off` touches this
+        -- flag and reloads; init_worker re-runs in the new workers and skips
+        -- spawning the active probers. The PASSIVE backstop (upstream
+        -- max_fails/fail_timeout) stays in force either way.
+        local off = io.open("/run/nginx-hc-disabled", "r")
+        if off then off:close() return end
         local hc = require "resty.upstream.healthcheck"
         -- ssl_verify=false: the probe only checks LIVENESS (§11.3); serving
         -- traffic is authenticated against the cache CA via proxy_ssl_verify.
