@@ -21,6 +21,112 @@ let
   upstreamHostMap = lib.concatStringsSep "\n      " (lib.mapAttrsToList
     (ns: u: let host = lib.removePrefix "https://" u.url; in ''"${ns}" "${host}";'')
     c.upstreams);
+
+  # ── model-store cache zones (§15) ─────────────────────────────────────
+  # One keys_zone + on-disk tree per modelStores entry. max_size caps are
+  # generous relative to the test corpus on a 50G data disk (proving
+  # functionality, not bulk storage); LRU + inactive=60d evict as needed.
+  modelCachePaths = lib.concatStringsSep "\n" (lib.mapAttrsToList (name: _: ''
+    proxy_cache_path /var/lib/cache/nginx/${name} levels=1:2
+      keys_zone=cache_${name}:16m max_size=5g inactive=60d use_temp_path=off;
+  '') c.modelStores);
+
+  modelTmpfiles = lib.mapAttrsToList
+    (name: _: "d /var/lib/cache/nginx/${name} 0750 nginx nginx - -")
+    c.modelStores;
+
+  # ── one vhost per model store (§15.2 http / §15.3 oci) ────────────────
+  # All listen TLS with the shared cache cert (client→cache hop, §11.5).
+  # The original origin FQDN arrives as X-Orig-Host (set by the client
+  # nginx after SNI termination); the cache→origin hop uses the PUBLIC CA.
+  httpLocations = name: {
+    "= /health" = { return = ''200 "ok\n"''; };
+    # Metadata + (for HF) the 302→CDN redirect we follow ourselves.
+    "/" = { extraConfig = ''
+      set $orig $http_x_orig_host;
+      if ($orig = "") { return 421; }   # require X-Orig-Host from client nginx
+      proxy_pass https://$orig;
+      proxy_ssl_server_name on;
+      proxy_ssl_name $orig;
+      proxy_set_header Host $orig;
+      proxy_set_header User-Agent "${c.userAgent}";
+      proxy_cache cache_${name};
+      proxy_cache_key "$orig:$uri";
+      proxy_cache_valid 200 206 60d;
+      proxy_cache_lock on;
+      proxy_intercept_errors on;
+      recursive_error_pages on;
+      error_page 301 302 303 307 308 = @follow_lfs;
+      add_header X-Cache-Status $upstream_cache_status;
+      add_header X-Cache-Upstream-Time $upstream_response_time;
+    ''; };
+    # Content-addressed CDN payloads (LFS/OSS) → key on the original path,
+    # signed query args dropped so the same file collapses to one entry.
+    "@follow_lfs" = { extraConfig = ''
+      set $cdn_url $upstream_http_location;
+      # Relative redirects (HF canonicalises model ids) have no scheme/host
+      # → re-resolve against the original origin; absolute ones (LFS/OSS CDN)
+      # pass through unchanged.
+      if ($cdn_url !~ "^https?://") { set $cdn_url "https://$orig$upstream_http_location"; }
+      proxy_pass $cdn_url;
+      proxy_ssl_server_name on;
+      proxy_set_header User-Agent "${c.userAgent}";
+      proxy_cache cache_${name};
+      proxy_cache_key "${name}-lfs:$uri";
+      proxy_cache_valid 200 206 60d;
+      proxy_cache_lock on;
+      add_header X-Cache-Status $upstream_cache_status;
+    ''; };
+  };
+
+  ociLocations = name: {
+    "= /health" = { return = ''200 "ok\n"''; };
+    # Immutable digest-addressed blobs → long TTL, key on the digest path.
+    "~ ^/v2/.+/blobs/sha256:" = { extraConfig = ''
+      set $orig $http_x_orig_host;
+      if ($orig = "") { return 421; }
+      proxy_pass https://$orig;
+      proxy_ssl_server_name on;
+      proxy_ssl_name $orig;
+      proxy_set_header Host $orig;
+      proxy_set_header User-Agent "${c.userAgent}";
+      proxy_cache cache_${name};
+      proxy_cache_key "${name}:blob:$uri";
+      proxy_cache_valid 200 206 60d;
+      proxy_cache_lock on;
+      add_header X-Cache-Status $upstream_cache_status;
+      add_header X-Cache-Upstream-Time $upstream_response_time;
+    ''; };
+    # Manifests/tags → short TTL.
+    "/" = { extraConfig = ''
+      set $orig $http_x_orig_host;
+      if ($orig = "") { return 421; }
+      proxy_pass https://$orig;
+      proxy_ssl_server_name on;
+      proxy_ssl_name $orig;
+      proxy_set_header Host $orig;
+      proxy_set_header User-Agent "${c.userAgent}";
+      proxy_cache cache_${name};
+      proxy_cache_key "${name}:$uri";
+      proxy_cache_valid 200 5m;
+      add_header X-Cache-Status $upstream_cache_status;
+      add_header X-Cache-Upstream-Time $upstream_response_time;
+    ''; };
+  };
+
+  mkModelVhost = name: store: {
+    listen = [{ addr = "0.0.0.0"; port = store.nginxPort; ssl = true; }];
+    extraConfig = ''
+      resolver 1.1.1.1 ipv6=off valid=300s;
+      ssl_certificate     /etc/nginx/cache/cache-server.crt;
+      ssl_certificate_key /etc/nginx/cache/cache-server.key;
+    '';
+    locations = if store.kind == "oci" then ociLocations name
+                else httpLocations name;
+  };
+
+  modelVhosts = lib.mapAttrs' (name: store:
+    lib.nameValuePair "model-${name}" (mkModelVhost name store)) c.modelStores;
 in
 {
   services.nginx = {
@@ -41,6 +147,9 @@ in
         keys_zone=cache_default:100m max_size=40g inactive=30d use_temp_path=off;
       proxy_cache_path /var/lib/cache/nginx/apt levels=1:2
         keys_zone=cache_apt:50m max_size=10g inactive=30d use_temp_path=off;
+
+      # Per-model-store zones (HF/ModelScope/PyTorch/Ollama), §15.
+      ${modelCachePaths}
 
       # Origins/CDNs send Set-Cookie (Cloudflare __cf_bm) and Cache-Control
       # that would otherwise stop nginx caching; we deliberately override
@@ -179,7 +288,7 @@ in
           };
         };
       };
-    };
+    } // modelVhosts;
   };
 
   # Cache dirs on the data disk, owned by the nginx service user.
@@ -188,7 +297,7 @@ in
     "d /var/lib/cache/nginx 0750 nginx nginx - -"
     "d /var/lib/cache/nginx/default 0750 nginx nginx - -"
     "d /var/lib/cache/nginx/apt 0750 nginx nginx - -"
-  ];
+  ] ++ modelTmpfiles;
 
   # The NixOS nginx unit runs under ProtectSystem=strict, which makes the
   # whole FS read-only except /var/cache/nginx, /var/log/nginx, /run/nginx.
