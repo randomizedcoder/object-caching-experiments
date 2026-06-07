@@ -147,6 +147,22 @@ rec {
   # Everything we MITM = model-store fqdns + HTTPS third-party repos.
   mitmExtraHosts = [ "download.docker.com" ];
 
+  # ─── MITM cert groups (focus-design §14.2/§14.3) ───────────────────
+  # Single source of truth for the per-client MITM leaf certs: one cert
+  # per SNI server{} unit. Each model store groups ALL its fqdns under
+  # one cert (server_name lists them together, §14.3); each mitmExtraHost
+  # is its own one-fqdn cert. Read by:
+  #   - secrets-gen.nix  (mints secrets/<client>/mitm/<name>.{crt,key})
+  #   - modules/mitm.nix (installs leaves to /etc/nginx/mitm + /etc/hosts)
+  #   - modules/nginx-client.nix (one :443 server{} per group)
+  mitmCertGroups =
+    (map (name: { inherit name; fqdns = modelStores.${name}.fqdns; })
+         (builtins.attrNames modelStores))
+    ++ (map (h: { name = h; fqdns = [ h ]; }) mitmExtraHosts);
+
+  # Flat list of every MITM'd FQDN → 127.0.0.1 /etc/hosts redirect.
+  mitmAllFqdns = builtins.concatLists (map (g: g.fqdns) mitmCertGroups);
+
   # ─── VM resources ──────────────────────────────────────────────────
   # NB: cache.mem = 8192 is an exact power of two. The sister repos avoid
   # powers of two (used 8191/10239) because QEMU hangs on some hosts; if

@@ -54,6 +54,16 @@ if !hasSecrets then {
     let f = secretsDir + "/cache/ca/cache-CA.crt";
     in if builtins.pathExists f then f else null;
 
-  # ── Phase 3 stub (null until that phase mints the per-client MITM CA) ─
-  clientMitm  = _nodeName: null;   # { ca; leaves; } per-client MITM (§14)
+  # ── Phase 3: per-client MITM CA + per-FQDN leaves (§14.2) ───────────
+  # Returns { ca; mitmDir; } for a client, or null until cache-gen-ca has
+  # minted that client's tree. `ca` is the per-client root (baked into the
+  # client's trust store + injected into containers); `mitmDir` holds the
+  # leaf <group>.{crt,key} that the client nginx loads per SNI server{}.
+  # Modules derive leaf filenames from constants.mitmCertGroups.
+  clientMitm = nodeName:
+    let
+      ca      = secretsDir + "/${nodeName}/ca/${nodeName}-CA.crt";
+      mitmDir = secretsDir + "/${nodeName}/mitm";
+    in if builtins.pathExists ca
+       then { inherit ca mitmDir; } else null;
 }
