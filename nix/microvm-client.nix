@@ -37,6 +37,7 @@ let
       ./modules/nginx-client.nix
       ./modules/docker-client.nix
       ./modules/mitm.nix
+      ./modules/ca-injector.nix
       ({ config, pkgs, ... }: {
         system.stateVersion  = "26.05";
         nixpkgs.hostPlatform = system;
@@ -122,6 +123,21 @@ let
         # impersonate the model-store origins without TLS errors. Distinct
         # from the cache CA above (that one only authenticates the cache).
         security.pki.certificateFiles = lib.optional (mitm != null) mitm.ca;
+
+        # Raw CA PEM at a fixed path + a COMBINED bundle (system public CAs
+        # ++ this MITM CA) the ca-injector (§14.4) bind-mounts into containers
+        # and points SSL_CERT_FILE/CURL_CA_BUNDLE/… at. deps=["etc"] so the
+        # system bundle (/etc/ssl/certs/ca-certificates.crt, from
+        # security.pki) already exists when we concatenate.
+        system.activationScripts.mitm-ca-file = {
+          deps = [ "etc" ];
+          text = lib.optionalString (mitm != null) ''
+            install -m 0644 ${mitm.ca} /etc/cache-mitm-ca.crt
+            cat /etc/ssl/certs/ca-certificates.crt /etc/cache-mitm-ca.crt \
+              > /etc/cache-mitm-ca-bundle.crt
+            chmod 0644 /etc/cache-mitm-ca-bundle.crt
+          '';
+        };
 
         # Install the per-FQDN leaf crt/key nginx loads per SNI server{}.
         # Owned by nginx (the config-test pre-start reads keys as that user),
