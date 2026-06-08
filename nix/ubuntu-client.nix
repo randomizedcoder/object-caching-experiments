@@ -220,6 +220,16 @@ in
       # so nerdctl pulls route through the local nginx OCI frontend.
       "docker/daemon.json".text = dockerDaemon;
       "containerd/certs.d/_default/hosts.toml".text = hostsTomlFor "https://registry-1.docker.io";
+
+      # apt proxy (§17): route ONLY the cached Ubuntu archive hosts through the
+      # local nginx apt frontend (http-only by design). Per-host (not a global
+      # proxy) so https repos like download.docker.com are left DIRECT — those
+      # are MITM'd at :443 via the /etc/hosts pin instead, and a global proxy
+      # would (wrongly) send them an unsupported CONNECT to the apt frontend.
+      "apt/apt.conf.d/01-cache-proxy".text =
+        lib.concatMapStringsSep "\n" (h:
+          ''Acquire::http::Proxy::${h} "http://127.0.0.1:${toString c.ports.clientApt}";'')
+          c.aptUpstreams + "\n";
     }
     certsdEtc
     (lib.optionalAttrs (cacheCa != null) {
