@@ -92,9 +92,22 @@
     # Applied IN-GUEST after Nix is installed: `system-manager switch
     # --flake <repo>#ubuntu-client`. Reuses constants.nix → one source of
     # truth across NixOS and Ubuntu. x86_64-linux only (the lab host).
-    // {
+    // (let
+      hostSystem  = "x86_64-linux";
+      hostPkgs    = nixpkgs.legacyPackages.${hostSystem};
+      hostSecrets = import (./nix + "/secrets.nix") {
+        pkgs = hostPkgs; lib = hostPkgs.lib;
+      };
+    in {
+      # One shared system-manager config for all three Ubuntu clients. The
+      # serving certs are node-agnostic, so the Ubuntu fleet reuses client0's
+      # MITM tree + the shared cache CA (secrets-gen.nix §14.2 note).
       systemConfigs.ubuntu-client = system-manager.lib.makeSystemConfig {
         modules = [ ./nix/ubuntu-client.nix ];
+        specialArgs = {
+          cacheCa = hostSecrets.cacheCaCert;          # public cache CA cert | null
+          mitm    = hostSecrets.clientMitm "client0"; # {ca;mitmDir} | null
+        };
       };
-    };
+    });
 }
