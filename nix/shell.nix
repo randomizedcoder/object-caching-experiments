@@ -11,6 +11,11 @@ pkgs.mkShell {
     step-cli        # CA / leaf cert minting
     nftables
     qemu
+    # Phase 4: Ubuntu cloud-image clients under libvirt
+    cloud-utils     # cloud-localds (NoCloud seed builder)
+    cdrkit          # genisoimage backend for cloud-localds
+    virt-manager    # virt-install
+    libvirt         # virsh
   ];
 
   shellHook = ''

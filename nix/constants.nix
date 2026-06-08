@@ -66,6 +66,22 @@ rec {
     };
   };
 
+  # ─── Ubuntu cloud images (Phase 4) ─────────────────────────────────
+  # Pinned dated releases from cloud-images.ubuntu.com (NOT the moving
+  # "release" symlink). Each Ubuntu client boots from one of these via
+  # cloud-init + virt-install, bridged onto cachebr0. sha256 is the raw
+  # hex from the release's SHA256SUMS. Only 24.04 is wired first; 22.04 /
+  # 26.04 get filled when we expand past ubuntu2404.
+  ubuntuImages = {
+    ubuntu2404 = {
+      release = "noble/release-20260518";
+      file    = "ubuntu-24.04-server-cloudimg-amd64.img";
+      sha256  = "53fdde898feed8b027d94baa9cfe8229867f330a1d9c49dc7d84465ee7f229f7";
+    };
+  };
+  ubuntuImageUrl = img:
+    "https://cloud-images.ubuntu.com/releases/${img.release}/${img.file}";
+
   # ─── Serial console ports ──────────────────────────────────────────
   # Each node gets a block of 10 ports starting at base. Base differs
   # from the k8s lab (25500) so both labs can run simultaneously.

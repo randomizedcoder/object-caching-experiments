@@ -8,10 +8,16 @@
       url = "github:astro/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Phase 4: configure the Ubuntu clients (non-NixOS) with NixOS-style
+    # modules via system-manager — no Ansible. See focus-design §16.
+    system-manager = {
+      url = "github:numtide/system-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, microvm }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, flake-utils, microvm, system-manager }:
+    (flake-utils.lib.eachDefaultSystem (system:
       let
         nixDir = ./nix;
         pkgs   = nixpkgs.legacyPackages.${system};
@@ -61,6 +67,7 @@
             net    = import (nixDir + "/network-setup.nix")   { inherit pkgs constants; };
             vm     = import (nixDir + "/microvm-scripts.nix") { inherit pkgs constants secrets; };
             secgen = import (nixDir + "/secrets-gen.nix")     { inherit pkgs constants; };
+            ubuntu = import (nixDir + "/ubuntu-vm.nix")       { inherit pkgs lib constants secrets; };
             mkApp  = drv: bin: { type = "app"; program = "${drv}/bin/${bin}"; };
           in {
             cache-check-host       = mkApp net.check      "cache-check-host";
@@ -75,6 +82,19 @@
             cache-vm-ssh           = mkApp vm.ssh         "cache-vm-ssh";
             cache-vm-stop          = mkApp vm.stop        "cache-vm-stop";
             cache-vm-wipe          = mkApp vm.wipe        "cache-vm-wipe";
+            # ── Phase 4: Ubuntu cloud-image clients (libvirt) ───────────
+            cache-ubuntu-up        = mkApp ubuntu.up      "cache-ubuntu-up";
+            cache-ubuntu-ssh       = mkApp ubuntu.ssh     "cache-ubuntu-ssh";
+            cache-ubuntu-down      = mkApp ubuntu.down    "cache-ubuntu-down";
           });
-      });
+      }))
+    # ── Phase 4: system-manager config for the Ubuntu clients ──────────
+    # Applied IN-GUEST after Nix is installed: `system-manager switch
+    # --flake <repo>#ubuntu-client`. Reuses constants.nix → one source of
+    # truth across NixOS and Ubuntu. x86_64-linux only (the lab host).
+    // {
+      systemConfigs.ubuntu-client = system-manager.lib.makeSystemConfig {
+        modules = [ ./nix/ubuntu-client.nix ];
+      };
+    };
 }
