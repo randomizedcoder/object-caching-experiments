@@ -146,6 +146,7 @@ in
       runcmd:
         - [ sh, -c, "mkdir -p /mnt/repo && (grep -q ' /mnt/repo ' /etc/fstab || echo 'repo /mnt/repo 9p trans=virtio,version=9p2000.L,ro,_netdev 0 0' >> /etc/fstab) && mount /mnt/repo || true" ]
         - [ sh, -c, "curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install linux --no-confirm --extra-conf 'experimental-features = nix-command flakes'" ]
+        - [ sh, -c, "curl -fsSL https://get.docker.com | sh && usermod -aG docker ubuntu" ]
         - [ sh, -c, "touch /etc/cache-lab-cloudinit-done" ]
       EOF
 

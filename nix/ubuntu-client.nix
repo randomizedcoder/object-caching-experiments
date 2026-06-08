@@ -46,15 +46,44 @@ let
 
   # /etc/hosts MITM block (host-level): pin every MITM'd FQDN to 127.0.0.1 so
   # host tools hit the local nginx :443. (Containers get the LAN IP instead,
-  # via ca-injector in 4b-3.) system-manager has no networking.extraHosts, so
+  # via ca-injector below.) system-manager has no networking.extraHosts, so
   # the cache-trust oneshot below maintains a marked block in /etc/hosts.
   hostsBlock = lib.concatMapStringsSep "\n" (f: "127.0.0.1 ${f}") c.mitmAllFqdns;
+
+  # Space-separated MITM FQDNs for the runtime container-hosts generator.
+  mitmFqdnList = lib.concatStringsSep " " c.mitmAllFqdns;
+
+  # ── containerd certs.d + docker (§12) ─────────────────────────────────
+  mirror = "http://127.0.0.1:${toString c.ports.clientOci}";
+  hostsTomlFor = url: ''
+    server = "${url}"
+
+    [host."${mirror}"]
+      capabilities = ["pull", "resolve"]
+  '';
+  # Per-registry hosts.toml (nerdctl reads /etc/containerd/certs.d by default).
+  certsdEtc = lib.mapAttrs' (ns: u:
+    lib.nameValuePair "containerd/certs.d/${ns}/hosts.toml"
+      { text = hostsTomlFor u.url; })
+    c.upstreams;
+
+  # The runc shim docker calls instead of runc (shared with the NixOS client).
+  wrapper = import ./ca-injector-wrapper.nix { inherit pkgs lib; };
+
+  # /etc/docker/daemon.json: containerd image store + docker.io mirror
+  # (demoted path) + the ca-injector runtime as default.
+  dockerDaemon = builtins.toJSON {
+    features = { containerd-snapshotter = true; };
+    registry-mirrors = [ mirror ];
+    default-runtime = "runc-with-ca";
+    runtimes."runc-with-ca".path = "${wrapper}/bin/runc-with-ca-wrapper";
+  };
 
   # Runtime trust + bundle + /etc/hosts. Replaces the NixOS security.pki +
   # mitm-ca-file activation (neither exists under system-manager).
   caTrust = pkgs.writeShellApplication {
     name = "cache-trust";
-    runtimeInputs = with pkgs; [ coreutils gnused gnugrep ];
+    runtimeInputs = with pkgs; [ coreutils gnused gnugrep iproute2 ];
     text = ''
       # Ubuntu's update-ca-certificates is a system script that shells out to
       # openssl/run-parts/etc; writeShellApplication pins PATH to runtimeInputs,
@@ -77,7 +106,8 @@ let
         chmod 0644 /etc/cache-mitm-ca-bundle.crt
       fi
 
-      # 3) /etc/hosts marked block (idempotent rewrite).
+      # 3) /etc/hosts marked block (idempotent rewrite). Host tools hit the
+      #    LOCAL nginx :443, so each MITM'd FQDN pins to 127.0.0.1.
       sed -i '/# BEGIN cache-lab MITM/,/# END cache-lab MITM/d' /etc/hosts
       {
         echo "# BEGIN cache-lab MITM"
@@ -86,6 +116,23 @@ ${hostsBlock}
 HOSTS
         echo "# END cache-lab MITM"
       } >> /etc/hosts
+
+      # 4) /etc/cache-mitm-hosts for the ca-injector (bind-mounted into every
+      #    container). Containers can't reach 127.0.0.1 (that's their OWN
+      #    loopback, §14.4) so each FQDN pins to THIS node's LAN IP — resolved
+      #    at runtime (node-agnostic) as the source addr toward the gateway.
+      nodeIp="$(ip -4 -o route get ${c.network.gateway4} 2>/dev/null \
+        | grep -oP 'src \K\S+' || true)"
+      if [ -n "$nodeIp" ]; then
+        {
+          echo "127.0.0.1 localhost"
+          echo "::1 localhost"
+          for f in ${mitmFqdnList}; do
+            echo "$nodeIp $f"
+          done
+        } > /etc/cache-mitm-hosts
+        chmod 0644 /etc/cache-mitm-hosts
+      fi
     '';
   };
 in
@@ -100,7 +147,7 @@ in
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-  environment.systemPackages = with pkgs; [ htop curl jq ];
+  environment.systemPackages = with pkgs; [ htop curl jq nerdctl wrapper ];
 
   # ── sysctl tuning (§18.1) ─────────────────────────────────────────────
   systemd.services.cache-sysctl = {
@@ -165,9 +212,16 @@ in
     {
       # Stub marker (confirms a switch took effect) + sysctl drop-in.
       "cache-ubuntu-client-stub".text =
-        "ubuntu-client system-manager stub (Phase 4b-2)\nuserAgent=${c.userAgent}\n";
+        "ubuntu-client system-manager stub (Phase 4b-3)\nuserAgent=${c.userAgent}\n";
       "sysctl.d/60-cache-lab.conf".text = sysctlConf;
+
+      # docker/containerd config (§12): containerd image store + docker.io
+      # mirror + ca-injector default runtime; per-registry certs.d hosts.toml
+      # so nerdctl pulls route through the local nginx OCI frontend.
+      "docker/daemon.json".text = dockerDaemon;
+      "containerd/certs.d/_default/hosts.toml".text = hostsTomlFor "https://registry-1.docker.io";
     }
+    certsdEtc
     (lib.optionalAttrs (cacheCa != null) {
       "nginx/cache-ca.crt".source = cacheCa;
     })
