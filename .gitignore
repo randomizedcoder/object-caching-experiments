@@ -28,3 +28,7 @@ rendered/
 
 # Ignore NixOS interactive test driver history
 **/.nixos-test-history
+
+# Local-only tooling / data — never part of the repo
+.claude/
+usage-data/
