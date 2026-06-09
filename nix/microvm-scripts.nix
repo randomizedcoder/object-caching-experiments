@@ -222,6 +222,12 @@ in
         "registry.k8s.io|pause|3.9|5054"
         "registry.k8s.io|coredns/coredns|v1.11.1|5054"
         "gcr.io|distroless/static|latest|5051"
+        "docker.io|runpod/flash|latest|5050"
+        "docker.io|runpod/flash|py3.12-latest|5050"
+        "docker.io|runpod/pytorch|2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04|5050"
+        "docker.io|runpod/pytorch|2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04|5050"
+        "docker.io|runpod/pytorch|2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04|5050"
+        "docker.io|runpod/comfyui|latest|5050"
       )
 
       # ns → real upstream base URL (from constants.upstreams).
@@ -326,7 +332,7 @@ in
       PAUSE_SECS=30
       CYCLES=0
       REPORT_NODES="client0,${builtins.concatStringsSep "," constants.cacheNames}"
-      IMAGES="registry.k8s.io/pause:3.9 registry.k8s.io/coredns/coredns:v1.11.1 gcr.io/distroless/static:latest alpine:latest ghcr.io/astral-sh/uv:latest"
+      IMAGES="registry.k8s.io/pause:3.9 registry.k8s.io/coredns/coredns:v1.11.1 gcr.io/distroless/static:latest alpine:latest ghcr.io/astral-sh/uv:latest runpod/flash:latest runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04 runpod/comfyui:latest"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --node=*)         NODE="''${1#*=}" ;;
