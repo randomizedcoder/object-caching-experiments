@@ -81,6 +81,19 @@ The lab exists to validate the nginx-only fabric against the requirements in [§
 7. **Model-store hit rate + MITM correctness.** Download the same HF / Ollama / ModelScope / PyTorch model twice; confirm the second is an nginx hit (`X-Cache-Status: HIT`) and that the client tools accept **that client's own** minted certs without TLS errors (proves [§14](06-mitm-and-content.md#14-https-interception-internal-ca--mitm) per-client trust insertion, including inside containers via the runc hook).
 8. **H3 vs H2 on owned listeners.** On the `:443` model-store listeners, compare HTTP/3 vs HTTP/2 transfer time for the multi-GB model files (toggle `Alt-Svc` / force the client) — the one place we control both ends and can actually run QUIC ([§11.4](04-client.md#114-transport--http-versions), [§18.3](07-tuning-observability.md#183-quic--http3-tuning)).
 
+### 21.1 Soak / hit-rate driver (`cache-load-loop`)
+
+To watch the hit ratio climb across the tiers over time, `nix run .#cache-load-loop` drives a client over SSH on a cadence: per cycle it **pulls** a small corpus, **runs** each image detached for the dwell window, **tears down** (`docker rm -f` + `docker rmi` — the `rmi` is what forces the next cycle's re-pull, since docker keeps layers locally otherwise), **pauses**, then repeats, printing a per-store cumulative `cs=HIT`/`cs=MISS` tally from the [§19](07-tuning-observability.md#19-observability-prometheus) split access logs after each cycle.
+
+```sh
+nix run .#cache-load-loop -- \
+  --node=client0 --run-secs=300 --pause-secs=30 --cycles=0 \
+  --images="registry.k8s.io/pause:3.9 alpine:latest" \
+  --report-nodes=client0,cache0,cache1
+```
+
+Flags: `--node` (driving client, default `client0`), `--run-secs` (dwell, 300), `--pause-secs` (idle gap, 30), `--cycles` (`0` = loop until Ctrl-C, with a clean teardown trap), `--images` (space-separated corpus, default a small public set spanning all five upstreams), `--report-nodes` (nginx layers to summarize). **Expected story:** cycle 1 misses at `client0` *and* the cache VMs (cold fill); cycles 2+ **HIT** at `client0`'s local hot tier (the `rmi` clears docker's content store, not nginx's cache), with little new cache-VM traffic. To exercise *shared-cache* (cache-VM) hits instead, point a second cold client at the same corpus (measurement #2 above) — its local tier misses but the shared tier HITs. This automates the warm/cold drills in [§20](#20-build-and-run-workflow).
+
 ---
 
 ## 22. Alternatives considered: client-side proxy
@@ -108,3 +121,53 @@ In every case the deciding factor is the same: nginx is **already** the cache (c
 - A two-cache **parent-child** hierarchy so a miss on one cache VM consults its sibling before going upstream. This is **drop-in precisely because the cache VMs already run OpenResty** ([§13](05-cache-vms.md#13-cache-vms-nginx-primary-and-zot-oracle)): the cache tier gains an upstream pool and reuses the *same* in-process Lua health-check + consistent-hash failover the clients use ([§11.3](04-client.md#113-health-checking-passive-and-in-process-active)) — no new component.
 - **Scale-out test at `n≥3`** to confirm the reduced failure blast radius ([§5](01-overview.md#5-requirements) #2); the in-process lua checker tracks each peer independently, so `n≥3` needs no extra config ([§11.3](04-client.md#113-health-checking-passive-and-in-process-active)).
 - Add more model stores (Civitai, GitHub LFS) by adding entries to `constants.modelStores` — the nginx vhosts generate automatically.
+
+---
+
+## 24. Local container-image lifecycle on cache clients
+
+[§3.1](01-overview.md#31-background-container-images-live-on-the-host-and-they-pile-up) established the problem: containerd stores every pulled image locally and **never** evicts it (no LRU, no size cap — only reference-based GC), so hosts grow until the disk fills. This section answers the natural follow-up: **once the multi-tier cache exists, what happens to those local images?**
+
+**The key clarification: a pull-through cache does *not* eliminate local images.** The cache sits between containerd and the upstream registry — it makes the *fetch* a deduplicated LAN hit instead of a WAN pull, but containerd on the client still downloads the image, unpacks it into a snapshot, and roots it permanently exactly as before ([§3.1](01-overview.md#31-background-container-images-live-on-the-host-and-they-pile-up)). So "containerd always pulls from nginx, therefore no local images" is **not** what a standard cache gives you. Bounding the local store is a *separate* decision, and the cache changes the cost/benefit of every option below — because it makes re-fetching a discarded image cheap. The options, in increasing ambition:
+
+1. **Do nothing — cache-accelerated re-pull (baseline).** Accept local growth; keep relying on host disk and whatever occasional manual `prune` happens today. The cache still earns its keep: after a prune, a disk wipe, an autoscale event, or a fresh host, the re-pull of the canonical base set ([§18.8](07-tuning-observability.md#188-recommended-cache-sizes-grounded-in-the-fleet-image-audit)) is a LAN hit, not a WAN pull. Simplest, but does **not** bound local disk.
+
+2. **Scheduled / threshold pruning (recommended PoC baseline).** A systemd timer running `docker image prune` (or a small agent replicating kubelet's `High`/`LowThresholdPercent` LRU) bounds the local store. The synergy with the cache is the point: LRU-pruning is normally a tradeoff (evicted images cost a full re-pull) but **with the cache backing every re-pull, aggressive pruning becomes cheap and safe**. This gives bounded local disk *today*, with no containerd/runtime changes.
+
+3. **Discard unpacked layers in containerd.** containerd can drop the compressed layer blobs from the content store after they're unpacked into the runnable snapshot (`discard_unpacked_layers` — `internal/cri/config/config.go`; `client.WithDiscardUnpackedLayers()`), keeping only the rootfs. Roughly halves footprint. The usual hesitation is that re-pushing/re-pulling then needs to refetch the blob — but, again, **the cache makes that refetch a cheap LAN hit**, so the cache makes this option materially safer than it is on a bare host. A config flag, not a new component.
+
+4. **Lazy-pulling via a remote snapshotter (the closest thing to "no local image").** Stargz/eStargz ([containerd stargz-snapshotter](https://github.com/containerd/stargz-snapshotter)), SOCI, or Nydus let a container **start before the image is downloaded**, fetching only the chunks actually read, on demand, from the registry — i.e. from *our cache* (`docs/snapshotters/remote-snapshotter.md`: "prepare these remote snapshots without pulling layers from registries"). Local footprint collapses to the working set actually touched rather than the whole image, and the cache is the ideal lazy-fetch backend: LAN-local, already deduplicated by digest. This is the genuine answer to "can containerd avoid storing whole images locally?" — **yes, but only with a remote snapshotter**, not with the cache alone. Cost: images must be in a lazy format (stargz conversion) or carry a SOCI index, plus the snapshotter plugin; coverage isn't universal. Aspirational — strongest once the cache itself is proven.
+
+**Recommendation.** For the production PoC, combine **(1)+(2)**: the cache for cheap fetches plus a prune policy for bounded local disk — this needs no runtime changes and the two reinforce each other. Evaluate **(3)** as an easy follow-on (one containerd flag, de-risked by the cache) and **(4)** as the higher-ceiling direction once the cache is trusted, since both lean on the cache to be safe and effective.
+
+### 24.1 Background: the SOCI snapshotter (lazy image loading)
+
+Option (4) above is the only one that genuinely shrinks the *local* image footprint to the working set actually read, so it's worth understanding in detail. The leading implementation is the **SOCI snapshotter** (Seekable OCI, pronounced "so-CHEE") from AWS Labs. This section is background only — the design for integrating it with *our* cache follows separately.
+
+References:
+- AWS deep-dive: <https://aws.amazon.com/blogs/containers/under-the-hood-lazy-loading-container-images-with-seekable-oci-and-aws-fargate/>
+- Source / docs: <https://github.com/awslabs/soci-snapshotter> (the file/line citations below are from this repo)
+
+**The core idea (and the user's intuition is right).** SOCI does **not** convert or repackage the image — it leaves the OCI/Docker image byte-for-byte **unmodified** and instead adds *a second artifact alongside it*: the **SOCI index**. That index is what lets containerd mount a layer and start the container *before* the layer is downloaded, fetching file contents on demand. So yes — it is "another index that makes image loading faster," and the precise mechanism is below. (The glossary deliberately avoids the term "SOCI image": there is no such thing — the image is unmodified, the index is a separate object — `docs/glossary.md`.)
+
+**What's in the index — the two-level data model** (`docs/index.md`):
+- **SOCI index manifest** — an OCI image manifest with a `subject` reference back to the image digest (so it's discoverable via the OCI **Referrers API**, `/v2/<name>/referrers/<digest>`), an empty config of mediaType `application/vnd.amazon.soci.index.v1+json`, and a `layers` array of **zTOC** descriptors (one per indexed image layer). Because it's a normal OCI artifact it lives in the **same registry** as the image, stored and distributed like any manifest.
+- **zTOC** ("z-table-of-contents", one per layer) — has two parts:
+  - **TOC**: per-file metadata + each file's **offset in the *uncompressed* tar** of the layer.
+  - **zInfo**: a set of compression **checkpoints**, each marking a **span** — a chunk of the gzip stream that can be decompressed independently (default **span size 4 MiB**, `soci/soci_index.go:81`).
+
+  Together these are what make a gzipped layer *seekable*: to read one file, SOCI maps file→tar-offset (TOC), finds which span(s) cover that offset (zInfo), fetches just those spans, and decompresses only them — instead of streaming and inflating the whole layer.
+
+**How a lazy pull works at runtime** (`docs/pull-modes.md`):
+1. The puller either passes `--soci-index-digest` or the snapshotter **discovers** the index through the Referrers API (with the tag-scheme fallback when a registry lacks Referrers).
+2. On first layer mount it fetches the SOCI manifest + zTOCs. If that fails, it **falls back to the default snapshotter** (overlayfs) and pulls normally — lazy loading is best-effort, never a hard dependency.
+3. Each **indexed** layer is mounted as a **FUSE** filesystem and loaded lazily; **un-indexed** layers are downloaded synchronously as normal overlay layers. Indices can be **"sparse"**: by default only layers above `--min-layer-size` get a zTOC (`cmd/soci/commands/create.go`), so tiny layers just download normally and only the big ones are lazily loaded.
+
+**The integration-critical detail: on-demand reads are HTTP `Range` GETs.** When the FUSE layer needs a span, the snapshotter issues a byte-range request against the layer's blob URL —
+`req.Header.Set("Range", "bytes=<lo>-<hi>")` (`fs/remote/resolver.go:307`) — with a **single-range fallback** for registries/CDNs that don't honour multi-range (`fs/remote/resolver.go:362,417`). This is the hook into our design: a SOCI client in front of our cache would pull (a) the **SOCI index artifacts** (manifest + zTOCs, via Referrers) and (b) **ranged slices of layer blobs** — both of which the nginx cache and the Zot oracle would need to serve and cache correctly. That's the substance of the integration design to follow.
+
+**Deployment shape.** SOCI runs as a separate daemon, `soci-snapshotter-grpc`, wired into containerd as a **proxy (remote) snapshotter** over a socket, started `Before=containerd.service` (`soci-snapshotter.service`). On the client side it's an extra service + a containerd config stanza, not a containerd patch.
+
+**Two operating modes + prefetch.** Beyond classic lazy loading, recent SOCI adds a **parallel-pull-unpack** mode (`docs/parallel-mode.md`): an *upfront* load like the default snapshotter, but with concurrent HTTP range-GET downloads and parallel unpacking — aimed at I/O-bound workloads that want the whole rootfs fast, and notably it also exposes `discard_unpacked_layers` (ties back to option (3)). There's also an experimental **prefetch** feature (`docs/prefetch.md`) to warm a targeted set of files/spans at startup. For our purpose the classic lazy mode is the one that minimises local storage.
+
+**Why this is attractive here.** Combined with the cache, lazy loading means a client fetches only the spans a container actually reads, from a LAN-local, digest-deduplicated cache — collapsing both the *startup wait* and the *local footprint* (§3.1) toward the real working set rather than the full image. The catch is that it requires **SOCI indices to exist** for the images (someone must run `soci create`/push, or the cache layer must produce/serve them) and the **registry path to support Referrers + ranged blob reads** — which is exactly what the integration design needs to work out next.

@@ -11,6 +11,26 @@ let
   statusPort = constants.ports.nginxStatus;
 in
 {
+  # §19 cache access-log format, defined once here (log_format is http-context
+  # and this module is imported by BOTH nginx roles — microvm-cache.nix and
+  # microvm-client.nix). The per-store `access_log <store>.log cache;` lines
+  # that USE this format live next to each proxy_cache zone in nginx-cache.nix /
+  # nginx-client.nix, so hits are read split-by-store the same way storage is
+  # split into per-workload ZFS pools (§18.6). Default OFF here → only the cache
+  # locations log; health probes and the localhost stub_status vhost stay quiet.
+  #
+  # MUST be commonHttpConfig, not appendHttpConfig: NixOS emits commonHttpConfig
+  # *before* the server blocks but appendHttpConfig *after* them, and nginx
+  # rejects a `log_format` referenced (by the per-store access_log lines in the
+  # vhosts) before it is defined — "unknown log format cache" → emerg on start.
+  services.nginx.commonHttpConfig = ''
+    log_format cache '$remote_addr "$request" $status '
+                     'cs=$upstream_cache_status rt=$request_time '
+                     'uct=$upstream_connect_time urt=$upstream_response_time '
+                     'bytes=$body_bytes_sent ns=$arg_ns';
+    access_log off;
+  '';
+
   services.prometheus.exporters.node = {
     enable = true;
     port   = constants.ports.nodeExporter;   # 9100

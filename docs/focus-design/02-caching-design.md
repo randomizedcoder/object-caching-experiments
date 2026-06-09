@@ -106,4 +106,41 @@ So Zot earns a permanent place in the design as the **reference**, while nginx i
 
 This is why the remainder of this document describes **nginx as the cache with Zot as the oracle**: both are built, but only nginx serves clients.
 
+> **Differential-test caveat.** The "manifest bytes/digests match" assertion above only holds when Zot is run with `PreserveDigest` + `docker2s2` compat (see [§7.5](#75-revisit-would-zot-in-path-be-better) and [§13.1.1](05-cache-vms.md#1311-what-zots-sync-rewrites-and-why-it-matters)). In Zot's *default* mode the oracle's manifest/config/index digests legitimately differ from the origin (Docker→OCI conversion), so the test must either run the oracle in PreserveDigest mode or compare only the **layer-blob digest set** (which is preserved either way), not the manifest digest.
+
+### 7.5 Revisit: would Zot-in-path be better?
+
+*Exploratory — this subsection does **not** change the committed design in [§7.4](#74-the-committed-design-nginx-cache-zot-as-verification-oracle); it records the analysis behind keeping it.*
+
+A reasonable alternative is to make **Zot the ingest tier**: Zot pulls and normalizes images from the origins, and nginx caches Zot's *output* downstream (clients → nginx → Zot → origin) instead of nginx fetching origins directly. The appeal is that Zot is a conformant OCI implementation that gives, for free, the things nginx replicates by hand ([§7.1](#71-what-zot-gives-for-free), [§7.2](#72-what-nginx-only-must-replicate-by-hand)): a canonical content-addressed store, GC, cross-repo dedup, and Prometheus metrics. The blocker is what Zot does to images on the way in — see [§13.1.1](05-cache-vms.md#1311-what-zots-sync-rewrites-and-why-it-matters): by default it transcodes Docker schema2 → OCI and **recomputes the manifest, index, and config digests**.
+
+| Criterion | Zot-in-path (default convert) | Zot-in-path (`PreserveDigest`) | nginx-primary / Zot-oracle (§7.4) |
+|---|---|---|---|
+| **Digest fidelity to origin** | Broken — manifest/index/config recomputed | Preserved (byte-for-byte) | Preserved (byte-exact pass-through) |
+| **Unmodified-pull rule** (`image@sha256:<origin>`) | **Violated** — 404 on origin digest | Holds | Holds |
+| **Foreign-layer images** | Skipped (`destination.go:204-207`) | Skipped | Pass through (nginx caches the bytes) |
+| **Config coupling** | none extra | requires `http.compat: ["docker2s2"]` | none |
+| **Serving-path availability surface** | Zot becomes a hard serving dependency (HA story needed) | same | Zot off path; nginx is the only critical serving tech ([§13](05-cache-vms.md#13-cache-vms-nginx-primary-and-zot-oracle)) |
+| **Cross-repo blob dedup** | Zot's store (rethink the consistent-hash key story, [§7.2](#72-what-nginx-only-must-replicate-by-hand)) | same | nginx, digest-keyed (already designed) |
+| **Free OCI policy/GC/metrics** | yes | yes | no — nginx hand-rolls policy |
+
+The decisive constraint is the project's hard rule that **unmodified pulls and Dockerfiles must work as-is**, including digest pins. That eliminates default-mode Zot-in-path outright. `PreserveDigest` mode survives the rule, but it (a) couples the cache to schema2-compat mode, (b) still drops foreign-layer images, and (c) turns Zot into a serving-path dependency whose HA we'd then have to engineer — whereas today nginx is the only critical serving tech and Zot's failure is invisible to clients.
+
+**Recommendation: keep [§7.4](#74-the-committed-design-nginx-cache-zot-as-verification-oracle).** The experiment below was run and **confirms the digest-divergence prediction**: default-mode Zot-in-path changes the client-visible image digest and 404s on origin-digest pins (and docker then silently falls back to the origin, so the cache is bypassed for pinned pulls). `PreserveDigest` mode avoids that but couples the cache to schema2-compat, still drops foreign-layer images, and makes Zot a serving-path dependency — buying nothing nginx's byte-exact pass-through doesn't already give us, while costing availability surface. So Zot stays the off-path oracle; it would only move in-path if a future measurement showed nginx materially diverging on hit-ratio/disk/auth.
+
+**Experiment (results).** Run on `ubuntu2204` against `cache0`, pointing docker's `registry-mirrors` at each path in turn (A = client nginx `:8088` → cache nginx `:8085`; B = Zot default `:5050`; C = a scratch Zot on `:5060` with `preserveDigest:true` + `http.compat:["docker2s2"]`). Test image: **`library/alpine:3.9`** — chosen deliberately because it is still served by Docker Hub as a **Docker schema2 manifest list** (`application/vnd.docker.distribution.manifest.list.v2+json`); note that most *current* Docker Hub library images (`alpine:3.20`, `ubuntu:22.04`, `nginx:1.25`, …) are **already OCI** and so pass through Zot unconverted — the conversion only bites legacy schema2 images.
+
+| | Path A — nginx | Path B — Zot default | Path C — Zot `PreserveDigest` | origin |
+|---|---|---|---|---|
+| top-level media type | `docker …list.v2` (pass-through) | `oci.image.index.v1` | `docker …list.v2` | `docker …list.v2` |
+| **index digest (client `RepoDigest`)** | `…414e0518` (= origin) | **`…4ef57e7d` (≠ origin)** | `…414e0518` (= origin) | `…414e0518` |
+| amd64 sub-manifest media type | docker v2 | `oci.image.manifest.v1` | docker v2 | docker v2 |
+| amd64 sub-manifest digest | = origin | **≠ origin** (`…27437c` vs `…65b3a8`) | = origin | `…65b3a8` |
+| config blob digest | `…78a2ce` | `…78a2ce` (same) | `…78a2ce` | `…78a2ce` |
+| layer blob digests | `…316035` | `…316035` (same) | `…316035` | `…316035` |
+| **origin-digest pin** (`curl` by `@sha256:<origin>`) | 200 | **404** | 200 | — |
+| `docker run` start (warm) | ~0.8–1.2 s | ~0.5–0.6 s | ~0.5–0.6 s | — |
+
+The prediction held exactly: **Path B (default Zot) changes the manifest and index digests** — the client records `RepoDigest …4ef57e7d`, *not* the origin's `…414e0518` — and a by-digest pull of the origin digest **404s** against Zot. Paths A and C preserve the origin digest and accept the pin. Across *all three* paths the **config blob and layer blob digests are identical** (`…78a2ce` / `…316035`): Zot only rewrites the manifest/index encoding, never the content blobs (see [§13.1.1](05-cache-vms.md#1311-what-zots-sync-rewrites-and-why-it-matters)). `docker run` start-times were within noise of each other (identical layers), so the rewrite costs nothing at *run* time — its only effect is the digest identity. (Pull wall-times are **not** a clean benchmark here: each upstream tier was warmed to a different degree during the run, and since the layer bytes are identical, steady-state pull cost is dominated by cache warmth, not by the path.) The route change was temporary and isolated to the one client; teardown restored the nginx-only mirror and a clean by-tag pull. A practical corollary: because docker's `registry-mirrors` **falls back to the origin** when the mirror 404s, digest-pinned pulls through default-mode Zot silently bypass the cache entirely — so default Zot-in-path gives *zero* cache benefit for exactly the pulls that pin a digest. (Workflow lives alongside [§20](08-operations.md#20-build-and-run-workflow).)
+
 ---

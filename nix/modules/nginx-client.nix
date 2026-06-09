@@ -66,7 +66,7 @@ let
       ssl_certificate     /etc/nginx/mitm/${g.name}.crt;
       ssl_certificate_key /etc/nginx/mitm/${g.name}.key;
 
-      proxy_cache oci_hot;                 # reuse the small local hot tier
+      proxy_cache model_hot;               # model-store hot tier (cache-http pool)
       location = /health { return 200 "ok\n"; }
       location / {
         set $cache_key "${g.name}:$host$uri";   # ketama peer selection
@@ -78,6 +78,7 @@ let
         proxy_pass https://${groupUpstream g};
         add_header X-Cache-Hot  $upstream_cache_status;
         add_header X-Cache-Time $request_time;
+        access_log /var/log/nginx/model.log cache;
       }
     }'') c.mitmCertGroups);
 in
@@ -105,8 +106,16 @@ in
       proxy_busy_buffers_size 32k;
 
       # ── local hot tiers (small on purpose, §5 Req#3) ──────────────────
-      proxy_cache_path /var/lib/cache/nginx/oci levels=1:2 keys_zone=oci_hot:64m
+      # Split per-workload across the same three ZFS pools as the cache VMs
+      # (focus-design §18.6); the on-disk paths ARE the dataset mountpoints.
+      #   manifests → cache-manifests pool   blobs → cache-blobs pool
+      #   apt,model → cache-http pool
+      proxy_cache_path /var/lib/cache/nginx/manifests levels=1:2 keys_zone=oci_hot_manifests:16m
+                       max_size=1g inactive=24h use_temp_path=off;
+      proxy_cache_path /var/lib/cache/nginx/blobs levels=1:2 keys_zone=oci_hot_blobs:32m
                        max_size=8g inactive=24h use_temp_path=off;
+      proxy_cache_path /var/lib/cache/nginx/model levels=1:2 keys_zone=model_hot:16m
+                       max_size=4g inactive=24h use_temp_path=off;
       proxy_cache_path /var/lib/cache/nginx/apt levels=1:2 keys_zone=apt_hot:16m
                        max_size=2g inactive=24h use_temp_path=off;
 
@@ -194,12 +203,13 @@ in
           "~ ^/v2/.+/blobs/sha256:" = {
             extraConfig = ''
               set $cache_key "blob:$oci_digest";
-              proxy_cache oci_hot;
+              proxy_cache oci_hot_blobs;
               proxy_cache_valid 200 206 30d;
               proxy_cache_min_uses 2;
               proxy_cache_lock on;
               proxy_next_upstream error timeout http_502 http_503 http_504 non_idempotent;
               proxy_pass https://shared_caches;
+              access_log /var/log/nginx/blobs.log cache;
             '';
           };
 
@@ -207,11 +217,12 @@ in
           "~ ^/v2/.+/manifests/" = {
             extraConfig = ''
               set $cache_key "$oci_ns:$uri";
-              proxy_cache oci_hot;
+              proxy_cache oci_hot_manifests;
               proxy_cache_valid 200 5m;
               proxy_cache_lock on;
               proxy_next_upstream error timeout http_502 http_503 http_504;
               proxy_pass https://shared_caches;
+              access_log /var/log/nginx/manifests.log cache;
             '';
           };
         };
@@ -238,6 +249,7 @@ in
               proxy_set_header Host $http_host;
               proxy_next_upstream error timeout http_502 http_503 http_504;
               proxy_pass https://shared_caches_apt;
+              access_log /var/log/nginx/apt.log cache;
             '';
           };
         };
@@ -245,12 +257,12 @@ in
     };
   };
 
-  # Hot-cache dirs on the data disk, owned by the nginx service user.
+  # Cache parents on the ext4 data disk; the per-workload leaf dirs
+  # (manifests/blobs/model/apt) are ZFS dataset mountpoints created and
+  # chowned by modules/zfs-cache-pools.nix before nginx starts (§18.6).
   systemd.tmpfiles.rules = [
     "d /var/lib/cache 0755 nginx nginx - -"
     "d /var/lib/cache/nginx 0750 nginx nginx - -"
-    "d /var/lib/cache/nginx/oci 0750 nginx nginx - -"
-    "d /var/lib/cache/nginx/apt 0750 nginx nginx - -"
   ];
 
   # ProtectSystem=strict makes /var/lib read-only to the nginx unit by

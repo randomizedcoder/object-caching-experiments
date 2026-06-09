@@ -100,9 +100,15 @@ NODES
       ROOT="''${PWD}/secrets"
       DIR="$ROOT/cache"
       FORCE=0
+      MITM_ONLY=0   # --mitm-only: skip cache-CA minting; reuse a copied-in
+                    # PUBLIC cache-CA.crt (bare-metal box, §16 bootstrap).
+      NODE=""       # --node=NAME: mint MITM only for NAME (default: all
+                    # constants.clientNames). Bare-metal boxes pass client0.
       for arg in "$@"; do
         case "$arg" in
           --force) FORCE=1 ;;
+          --mitm-only) MITM_ONLY=1 ;;
+          --node=*) NODE="''${arg#--node=}" ;;
           *) echo "unknown arg: $arg" >&2; exit 2 ;;
         esac
       done
@@ -111,7 +117,18 @@ NODES
       # Idempotent + additive: skip if already minted (so re-running to add
       # a client's MITM CA doesn't rotate the working cache CA). --force
       # rotates it (rebuild + redistribute trust afterwards).
-      if [ -e "$DIR" ] && [ "$FORCE" -ne 1 ]; then
+      if [ "$MITM_ONLY" -eq 1 ]; then
+        # Bare-metal box: the canonical cache CA (with key) is minted only in
+        # the lab; the box just needs the PUBLIC cert for proxy_ssl_verify.
+        # Require it pre-copied (cache-ubuntu-deploy drops only this one file).
+        if [ ! -f "$DIR/ca/cache-CA.crt" ]; then
+          echo "ERROR: --mitm-only requires $DIR/ca/cache-CA.crt." >&2
+          echo "       Copy the PUBLIC cache CA cert from the lab first" >&2
+          echo "       (secrets/cache/ca/cache-CA.crt — public, no key)." >&2
+          exit 1
+        fi
+        echo "--mitm-only: reusing public cache CA at $DIR/ca/cache-CA.crt (cache CA not minted)."
+      elif [ -e "$DIR" ] && [ "$FORCE" -ne 1 ]; then
         echo "cache CA exists at $DIR — skipping (use --force to rotate)."
       else
         rm -rf "$DIR"
@@ -151,6 +168,13 @@ EXT
       # Each client mints+trusts its OWN root CA (full isolation), then one
       # leaf per mitmCertGroups entry signed by that CA. SAN = the group's
       # fqdns. Distinct trust tree from the cache CA above.
+      # --node=NAME narrows the loop to a single client (bare-metal box);
+      # default is every constants.clientNames entry.
+      if [ -n "$NODE" ]; then
+        CLIENTS_LIST="$NODE"
+      else
+        CLIENTS_LIST="${clientLines}"
+      fi
       while read -r client; do
         [ -z "$client" ] && continue
         CLDIR="$ROOT/$client"
@@ -196,8 +220,8 @@ EXT
 ${mitmGroupLines}
 GROUPS
         echo "MITM CA + leaves for $client written to $CLDIR"
-      done <<'CLIENTS'
-${clientLines}
+      done <<CLIENTS
+$CLIENTS_LIST
 CLIENTS
 
       # Make untracked files visible to the flake (pure-eval sees only

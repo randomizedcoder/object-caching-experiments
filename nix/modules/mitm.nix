@@ -13,7 +13,7 @@
 let
   c = import ../constants.nix;
   # "127.0.0.1 fqdn" per MITM'd host (model stores + mitmExtraHosts, §14.3).
-  hostsBlock = lib.concatMapStringsSep "\n" (f: "127.0.0.1 ${f}") c.mitmAllFqdns;
+  hostsBlock = import ../lib/mitm-hosts.nix { inherit lib; fqdns = c.mitmAllFqdns; };
 in
 {
   # DNS redirection (no DNS server in v1 — /etc/hosts poisoning, §14.3).

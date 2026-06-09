@@ -42,6 +42,22 @@
 
 **Transport:** the containerd→local-nginx hop is **HTTP/1.1** (containerd speaks nothing else — [§12](04-client.md#12-containerd-client-config-unmodified-dockerfiles)). On the listeners we own (the MITM / model-store `:443` frontends) nginx offers **HTTP/3 + HTTP/2**. The nginx→cache hop is **HTTP/1.1 over TLS** (encrypted + verified against the internal cache CA, [§11.5](04-client.md#115-encrypted-client-to-cache-hop-tls)); nginx cannot originate H3 upstream, so node-to-node H3 is future work.
 
+### 3.1 Background: container images live on the host, and they pile up
+
+Before the cache changes anything, it helps to be precise about where container images live **today** and why hosts accumulate so much of them — because the cache (below) changes how images are *fetched*, not whether they are *stored locally*.
+
+Every `docker pull` lands the image on the host twice over: the **content store** keeps the compressed layer blobs + manifest + config, and the **snapshotter** keeps the *unpacked* rootfs that the container actually runs from. Both persist on local disk after the pull.
+
+**Crucially, there is no LRU and no size cap on that local store.** containerd's only lifecycle mechanism is **reference-based mark-and-sweep garbage collection** (tri-color reachability — `pkg/gc/gc.go`), and it is driven entirely by *references*, never by disk usage:
+
+- A pulled, tagged image is a **permanent GC root that never expires** (`core/metadata/gc.go`: "image objects are root objects that never expire"). Its blobs and snapshots are reachable, so GC will never touch them as long as the image exists.
+- GC reclaims only content that has become **unreferenced** — e.g. the unique layers orphaned when a tag is overwritten, or a container's rootfs snapshot after the container is removed. That orphaned remainder is the "reclaimable" figure in `docker system df`.
+- GC is **triggered by metadata churn, not disk pressure** (`plugins/gc/scheduler.go`: a mutation/deletion count threshold + a manual trigger — there is no high-water-mark or size knob anywhere).
+
+Docker layers nothing on top of this — it has no automatic eviction either. Reclamation requires an explicit `docker image prune` / `rmi` / `system prune`. (The one place LRU eviction *does* exist is **Kubernetes kubelet** image GC, with its `High`/`LowThresholdPercent` disk-based LRU — but these are plain-docker hosts that don't run it.)
+
+**The consequence is unbounded growth until the disk fills.** This is exactly what the fleet audit ([§18.8](07-tuning-observability.md#188-recommended-cache-sizes-grounded-in-the-fleet-image-audit)) measures: **2.13 PB** of fleet image storage, **73.7 % of it reclaimable** — the steady state of a fleet that pulls constantly and prunes rarely. Introducing the cache does **not** by itself change this: containerd still downloads, unpacks, and permanently roots every image locally. What to do about the local store once the cache exists is its own design question — see [§24](08-operations.md#24-local-container-image-lifecycle-on-cache-clients).
+
 ---
 
 ## 4. End-to-end flows

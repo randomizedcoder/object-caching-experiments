@@ -77,7 +77,7 @@ The client→cache hop is TLS under the **cache CA** ([§11.5](04-client.md#115-
 Each client trusts **only its own** per-client CA ([§14.2](#142-the-internal-ca-and-per-fqdn-certs)):
 
 - **NixOS `client0`**: `security.pki.certificateFiles = [ caCrt ]` where `caCrt` is *this host's* CA (`secrets/client0/ca/client0-CA.crt`), plus the `/etc/hosts` block via `networking.extraHosts`.
-- **Ubuntu clients**: Ansible `mitm-trust` role drops **that host's** CA (`secrets/<client>/ca/<client>-CA.crt`) into `/usr/local/share/ca-certificates/` + `update-ca-certificates`, and appends the `/etc/hosts` block.
+- **Ubuntu clients**: the `cache-trust` systemd oneshot (rendered by `nix/ubuntu-client.nix` via system-manager) drops **that host's** CA (`secrets/<client>/ca/<client>-CA.crt`) into `/usr/local/share/ca-certificates/` + `update-ca-certificates`, and appends the `/etc/hosts` block — same end state as `client0`, no Ansible.
 - **Inside containers** (a `docker run python … huggingface-cli download` must also trust us): the `ca-injector.nix` **runc prestart hook** bind-mounts **the local host's** CA into each container's trust path and adds the `/etc/hosts` entries — so a container validates the same host it runs on. No Dockerfile change, preserving the unmodified-Dockerfile constraint. (Full design: `design.md` §13.5.)
 
 > **Trust-boundary scope.** This is safe *only* because the lab is a private bridge we fully control. The CA must never leave `secrets/` and this design must never be lifted onto a multi-tenant or untrusted network.
@@ -168,7 +168,7 @@ Both are HF-shaped HTTPS file downloads with their own object CDNs (`modelscope`
 
 ## 16. Ubuntu clients
 
-Three real-world rigs to prove the design holds on stock distros, lifted from the `runpod/ansible-host` Vagrant+libvirt pattern:
+Three real-world rigs to prove the design holds on stock distros. They run the **same Nix modules** as `client0`, applied to non-NixOS Ubuntu by [numtide/system-manager](https://github.com/numtide/system-manager) — the non-NixOS analogue of `nixos-rebuild switch`. There is **no Ansible**; `constants.nix` stays the single source of truth across NixOS and Ubuntu.
 
 | client       | Docker install path                    | role                                            |
 |--------------|----------------------------------------|-------------------------------------------------|
@@ -176,15 +176,45 @@ Three real-world rigs to prove the design holds on stock distros, lifted from th
 | `ubuntu2404` | `docker-ce` (download.docker.com)      | current recommended path                        |
 | `ubuntu2604` | `docker-ce`                            | next-LTS coverage                               |
 
-Each Ubuntu VM bridges onto `cachebr0` via libvirt `:public_network, :dev => "cachebr0"` with a static IP/MAC from `constants.nix`, and is configured by Ansible to run the **same** logical stack as `client0`: containerd `hosts.toml`, the client **OpenResty** nginx (local hot tier + hash router + :443 MITM + in-process Lua health-checks, [§11.3](04-client.md#113-health-checking-passive-and-in-process-active)), MITM CA trust + `/etc/hosts` ([§14](#14-https-interception-internal-ca--mitm)), the **cache CA** at `/etc/nginx/cache-ca.crt` for the encrypted client→cache hop ([§11.5](04-client.md#115-encrypted-client-to-cache-hop-tls)), kernel sysctls ([§18.1](07-tuning-observability.md#181-kernel--network-sysctls-all-machines)), node_exporter. OpenResty installs from its own apt repo rather than the distro nginx. Box pins (reused from runpod):
+`nix/ubuntu-client.nix` is the system-manager config. It **imports `modules/nginx-client.nix` verbatim** (the client OpenResty: local hot tier + hash router + :443 MITM + in-process Lua health-checks, [§11.3](04-client.md#113-health-checking-passive-and-in-process-active)) and renders everything system-manager doesn't carry as plain `systemd.services` + `environment.etc`: kernel sysctls ([§18.1](07-tuning-observability.md#181-kernel--network-sysctls-all-machines)), node/nginx exporters, docker `daemon.json` + containerd `certs.d/*/hosts.toml`, the apt proxy drop-in ([§17](#17-apt-caching)), and the **`cache-trust`** oneshot (per-host MITM CA into the system store + `/etc/hosts` block, [§14](#14-https-interception-internal-ca--mitm)). The **cache CA** lands at `/etc/nginx/cache-ca.crt` for the encrypted client→cache hop ([§11.5](04-client.md#115-encrypted-client-to-cache-hop-tls)). system-manager does **not** install docker (no `virtualisation.*` off NixOS) — it only drops the config; the engine is installed separately (cloud-init / `bootstrap.sh`).
+
+### 16.1 Apply verb: `system-manager switch`, not `nix build`
+
+`nix build .#ubuntu-client` only realizes a derivation into `/nix/store` + a `result` symlink — it writes nothing to `/etc`, installs no units, trusts no CA. `nix profile install` covers only CLI tools. The verb that actually applies system state is:
 
 ```
-2204: bento,       202502.21.0, sha256 1db70l5bcrnrs9sxq2rlldq7kb4lhcxw1qscg6lmlxz6fyv57dl2
-2404: bento,       202508.03.0, sha256 1pazin59p565bvx85r4parfwfrgn0iggdfrzfqw98clp6a8ij1nh
-2604: cloud-image, 20260421.0.0, sha256 0jzcg72ii492si4rr88ayrjkm0xkvpf9c47anbwfj3qfr0m88fab
+sudo nix run github:numtide/system-manager -- switch --flake .#ubuntu-client
 ```
 
-Ansible roles (under `ansible/roles/`): `docker/install`, `containerd/hosts-toml`, `nginx-client` (OpenResty + Lua healthcheck), `mitm-trust` (per-client MITM CA into the system store **and** the cache CA into `/etc/nginx/cache-ca.crt`, [§11.5](04-client.md#115-encrypted-client-to-cache-hop-tls)), `sysctls`, `node_exporter`. Each role's templates are fed the same `constants.nix` data via a `nix eval --json` export, so there is one source of truth across NixOS and Ubuntu. Both client types must produce semantically equivalent end state — verified by running the same `docker pull` + `apt install` + `huggingface-cli download` workload from each and comparing cache metrics.
+### 16.2 Lab VMs (libvirt + cloud-init)
+
+Each Ubuntu VM boots the pinned **official cloud image** directly under libvirt (`qemu:///system`), bridged onto `cachebr0` with a static IP/MAC from `constants.nix` (`nix run .#cache-ubuntu-up -- --node=ubuntu2404`). cloud-init seeds the lab SSH key, 9p-mounts this repo at `/mnt/repo`, and installs Determinate Nix + Docker. The config is then applied with `system-manager switch --flake /mnt/repo#ubuntu-client`. Image pins:
+
+```
+2204: 202502.21.0, sha256 1db70l5bcrnrs9sxq2rlldq7kb4lhcxw1qscg6lmlxz6fyv57dl2
+2404: 202508.03.0, sha256 1pazin59p565bvx85r4parfwfrgn0iggdfrzfqw98clp6a8ij1nh
+2604: 20260421.0.0, sha256 0jzcg72ii492si4rr88ayrjkm0xkvpf9c47anbwfj3qfr0m88fab
+```
+
+### 16.3 Bare-metal runbook (a real Ubuntu box)
+
+A stock Ubuntu host becomes a cache client with the same modules. One command from the lab:
+
+```
+nix run .#cache-ubuntu-deploy -- --host=user@<box> [--dest=/opt/cache-lab] [--key=<ssh key>]
+```
+
+It rsyncs the repo (default-deny `secrets/`, allow-listing **only** the public `secrets/cache/ca/cache-CA.crt` — no private key ever transits), then runs `ubuntu/bootstrap.sh` on the box. The bootstrap is idempotent and does, on the box:
+
+1. ensure Nix (flakes) and Docker are installed;
+2. assert the public `cache-CA.crt` is present (the client→cache verify cert; its private key stays in the lab);
+3. mint **this box's own** MITM tree locally — `nix run .#cache-gen-ca -- --mitm-only --node=client0` — reusing the copied-in public cache CA and the `client0` secrets slot the config already reads (the canonical cache/MITM CA keys never leave the lab);
+4. `system-manager switch --flake .#ubuntu-client`;
+5. restart Docker so it re-reads the new `daemon.json`.
+
+To do it by hand: rsync the repo yourself, drop the public `cache-CA.crt` into `secrets/cache/ca/`, and run `sudo bash ubuntu/bootstrap.sh` from the repo root.
+
+Both client types (NixOS `client0` and Ubuntu) must produce semantically equivalent end state — verified by running the same `docker pull` + `apt install` + `huggingface-cli download` workload from each and comparing cache metrics.
 
 ---
 

@@ -15,6 +15,8 @@ let
 
   knownHosts = secrets.knownHostsPath;   # path | null
 
+  sh = import ./lib/sh-helpers.nix { inherit (pkgs) lib; };
+
   # bash `case` arm: node) IP ;;
   ipCases = builtins.concatStringsSep "\n        " (builtins.map
     (n: "${n}) echo ${constants.network.ipv4.${n}} ;;") allNodes);
@@ -38,32 +40,19 @@ let
       unset SSH_AUTH_SOCK || true
 
       CA="''${PWD}/secrets/cache/ca/cache-CA.crt"
-      KEY="''${PWD}/secrets/ssh-ed25519"
       if [[ ! -f "$CA" ]]; then
         echo "ERROR: $CA not found. Run 'nix run .#cache-gen-ca' first." >&2
         exit 1
       fi
-      if [[ ! -f "$KEY" ]]; then
-        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
-        exit 1
-      fi
-      ${if knownHosts == null then ''
-      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' first." >&2
-      exit 1
-      '' else ''
+      ${sh.requireKey}
+      ${if knownHosts == null then sh.noKnownHosts else ''
       # shellcheck disable=SC2043  # list is Nix-generated; may be a single client
       for spec in ${builtins.concatStringsSep " " (builtins.map
         (n: "${n}:${constants.network.ipv4.${n}}") constants.clientNames)}; do
         node="''${spec%%:*}"; ip="''${spec##*:}"
         echo "[$node] pushing cache CA to root@$ip:/etc/nginx/cache-ca.crt"
-        scp -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=${knownHosts} \
-            -o IdentitiesOnly=yes -i "$KEY" \
-            "$CA" "root@$ip:/etc/nginx/cache-ca.crt"
-        ssh -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=${knownHosts} \
-            -o IdentitiesOnly=yes -i "$KEY" \
-            "root@$ip" 'systemctl reload nginx 2>/dev/null || true'
+        scp ${sh.sshOpts knownHosts} "$CA" "root@$ip:/etc/nginx/cache-ca.crt"
+        ssh ${sh.sshOpts knownHosts} "root@$ip" 'systemctl reload nginx 2>/dev/null || true'
       done
       echo "Cache CA distributed to: ${builtins.concatStringsSep " " constants.clientNames}"
       ''}
@@ -147,22 +136,13 @@ in
         exit 2
       fi
 
-      KEY="''${PWD}/secrets/ssh-ed25519"
-      if [[ ! -f "$KEY" ]]; then
-        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
-        exit 1
-      fi
+      ${sh.requireKey}
 
       ${if knownHosts == null then ''
       echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' then re-evaluate." >&2
       exit 1
       '' else ''
-      exec ssh \
-        -o StrictHostKeyChecking=yes \
-        -o UserKnownHostsFile=${knownHosts} \
-        -o IdentitiesOnly=yes \
-        -i "$KEY" \
-        "root@$ip" "''${ARGS[@]}"
+      exec ssh ${sh.sshOpts knownHosts} "root@$ip" "''${ARGS[@]}"
       ''}
     '';
   };
@@ -321,6 +301,125 @@ in
     '';
   };
 
+  # ── cache load-loop: soak driver to watch per-store cache hits (§21) ──
+  # Drives a client over SSH on a cadence — pull → run → dwell → teardown
+  # (rmi, which FORCES the next cycle's re-pull) → pause → repeat — so the
+  # §19 per-store access logs (manifests.log / blobs.log / apt.log / …) show
+  # MISS on cycle 1 and HIT on cycles 2+. Docker keeps image layers locally,
+  # so the rmi each cycle is what sends the next pull back through nginx.
+  # Reported counts are CUMULATIVE per store, so the HIT column climbing
+  # cycle-over-cycle is the thing to watch. NB: this exercises the driving
+  # client's LOCAL hot tier; to see SHARED-cache (cache-VM) hits, drive a
+  # second client so its first pull misses locally but hits the shared tier.
+  loadLoop = pkgs.writeShellApplication {
+    name = "cache-load-loop";
+    runtimeInputs = with pkgs; [ openssh coreutils ];
+    # SC2016: the single-quoted blocks are remote commands run over SSH — their
+    # $vars must expand on the target node, not locally. The expansion is intended.
+    excludeShellChecks = [ "SC2016" ];
+    text = ''
+      set -euo pipefail
+      unset SSH_AUTH_SOCK || true
+
+      NODE="client0"
+      RUN_SECS=300
+      PAUSE_SECS=30
+      CYCLES=0
+      REPORT_NODES="client0,${builtins.concatStringsSep "," constants.cacheNames}"
+      IMAGES="registry.k8s.io/pause:3.9 registry.k8s.io/coredns/coredns:v1.11.1 gcr.io/distroless/static:latest alpine:latest ghcr.io/astral-sh/uv:latest"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --node=*)         NODE="''${1#*=}" ;;
+          --run-secs=*)     RUN_SECS="''${1#*=}" ;;
+          --pause-secs=*)   PAUSE_SECS="''${1#*=}" ;;
+          --cycles=*)       CYCLES="''${1#*=}" ;;
+          --report-nodes=*) REPORT_NODES="''${1#*=}" ;;
+          --images=*)       IMAGES="''${1#*=}" ;;
+          --) ;;
+          *) echo "usage: cache-load-loop -- [--node=N] [--run-secs=S] [--pause-secs=S] [--cycles=N] [--images=\"a b c\"] [--report-nodes=a,b]" >&2; exit 2 ;;
+        esac
+        shift
+      done
+
+      ${sh.requireKey}
+      ${if knownHosts == null then ''
+      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' then re-evaluate." >&2
+      exit 1
+      '' else ""}
+      node_ip() {
+        case "$1" in
+          ${ipCases}
+          *) echo "" ;;
+        esac
+      }
+
+      # Run a command on a node over SSH (same wiring as cache-vm-ssh).
+      cssh() {
+        local node="$1"; shift
+        local ip; ip="$(node_ip "$node")"
+        if [[ -z "$ip" ]]; then echo "ERROR: unknown node '$node'" >&2; return 2; fi
+        ssh ${sh.sshOpts (if knownHosts == null then "/dev/null" else knownHosts)} "root@$ip" "$@"
+      }
+
+      # Per-store cumulative HIT/MISS tally over the §19 split access logs.
+      # cs=[A-Z_]+ requires ≥1 uppercase letter, so the lua active-HC HEAD /v2/
+      # 404s (logged as cs=-) are skipped — only HIT/MISS/EXPIRED/STALE/etc count.
+      report_node() {
+        local node="$1"
+        echo "  [$node]"
+        cssh "$node" '
+          shopt -s nullglob
+          for f in /var/log/nginx/*.log; do
+            store="$(basename "$f" .log)"
+            line="$(grep -hoE "cs=[A-Z_]+" "$f" 2>/dev/null | sort | uniq -c | tr "\n" " ")"
+            [[ -n "$line" ]] && printf "    %-14s %s\n" "$store" "$line" || true
+          done
+        ' || true
+      }
+
+      read -r -a IMG_ARR <<< "$IMAGES"
+      echo "cache-load-loop: node=$NODE run=''${RUN_SECS}s pause=''${PAUSE_SECS}s cycles=$CYCLES report=$REPORT_NODES"
+      echo "images: ''${IMG_ARR[*]}"
+
+      teardown() {
+        echo "→ teardown (rm containers + rmi images)"
+        cssh "$NODE" 'docker ps -aq --filter "name=cacheload_" | xargs -r docker rm -f >/dev/null 2>&1 || true' || true
+        for img in "''${IMG_ARR[@]}"; do
+          cssh "$NODE" "docker rmi -f '$img' >/dev/null 2>&1 || true" || true
+        done
+      }
+      trap 'echo; echo "interrupted — cleaning up"; teardown; exit 0' INT TERM
+
+      cycle=0
+      while :; do
+        cycle=$((cycle+1))
+        echo ""
+        echo "═══ cycle $cycle ═══"
+        i=0
+        for img in "''${IMG_ARR[@]}"; do
+          i=$((i+1))
+          echo "→ pull $img"
+          cssh "$NODE" "docker pull '$img'" || echo "  (pull failed: $img)"
+          cssh "$NODE" "docker run -d --rm --name cacheload_$i '$img' sleep $RUN_SECS >/dev/null 2>&1 || docker run -d --rm --name cacheload_$i '$img' >/dev/null 2>&1 || true" || true
+        done
+
+        echo "→ dwell ''${RUN_SECS}s"
+        sleep "$RUN_SECS"
+        teardown
+
+        echo "→ cumulative cache status after cycle $cycle:"
+        IFS=',' read -r -a RNODES <<< "$REPORT_NODES"
+        for rn in "''${RNODES[@]}"; do report_node "$rn"; done
+
+        if [[ "$CYCLES" -ne 0 && "$cycle" -ge "$CYCLES" ]]; then
+          echo ""; echo "done ($cycle cycles)"; break
+        fi
+        echo "→ pause ''${PAUSE_SECS}s"
+        sleep "$PAUSE_SECS"
+      done
+    '';
+  };
+
   # ── Phase 2f: toggle the client's in-process active health-check (§11.3) ──
   # Writes/removes /run/nginx-hc-disabled on each client and reloads nginx;
   # the init_worker_by_lua_block kill-switch (nginx-client.nix) skips spawning
@@ -347,15 +446,8 @@ in
         exit 2
       fi
 
-      KEY="''${PWD}/secrets/ssh-ed25519"
-      if [[ ! -f "$KEY" ]]; then
-        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
-        exit 1
-      fi
-      ${if knownHosts == null then ''
-      echo "ERROR: no known_hosts baked. Run 'nix run .#cache-gen-secrets' first." >&2
-      exit 1
-      '' else ''
+      ${sh.requireKey}
+      ${if knownHosts == null then sh.noKnownHosts else ''
       if [[ "$STATE" == "off" ]]; then
         cmd='touch /run/nginx-hc-disabled && systemctl reload nginx'
       else
@@ -365,10 +457,7 @@ in
       for ip in ${builtins.concatStringsSep " " (builtins.map
         (n: constants.network.ipv4.${n}) constants.clientNames)}; do
         echo "[$ip] active health-check → $STATE"
-        ssh -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=${knownHosts} \
-            -o IdentitiesOnly=yes -i "$KEY" \
-            "root@$ip" "$cmd"
+        ssh ${sh.sshOpts knownHosts} "root@$ip" "$cmd"
       done
       echo "Active health-check set $STATE on: ${builtins.concatStringsSep " " constants.clientNames}"
       ''}
@@ -405,12 +494,25 @@ in
         pkill -f "process=$hostname" || true
         sleep 1
       fi
-      img="''${PWD}/$hostname-data.img"
-      if [[ -f "$img" ]]; then
-        rm -f "$img"
-        echo "Wiped $img (next boot is cold)"
+      # Data disk plus the per-workload ZFS pool volumes (§18.6). Deleting
+      # the pool images forces zfs-cache-pools.nix to recreate empty pools
+      # on next boot (the only way to truly reset dedup/usage state).
+      wiped=0
+      for img in \
+        "''${PWD}/$hostname-data.img" \
+        "''${PWD}/$hostname-manifests.img" \
+        "''${PWD}/$hostname-blobs.img" \
+        "''${PWD}/$hostname-http.img"; do
+        if [[ -f "$img" ]]; then
+          rm -f "$img"
+          echo "Wiped $img"
+          wiped=1
+        fi
+      done
+      if [[ "$wiped" -eq 1 ]]; then
+        echo "Next boot for $NODE is cold (data + ZFS pools recreated)"
       else
-        echo "No data image for $NODE ($img)"
+        echo "No images for $NODE (nothing to wipe)"
       fi
     '';
   };

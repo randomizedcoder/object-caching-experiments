@@ -31,10 +31,6 @@ let
       keys_zone=cache_${name}:16m max_size=5g inactive=60d use_temp_path=off;
   '') c.modelStores);
 
-  modelTmpfiles = lib.mapAttrsToList
-    (name: _: "d /var/lib/cache/nginx/${name} 0750 nginx nginx - -")
-    c.modelStores;
-
   # ── one vhost per model store (§15.2 http / §15.3 oci) ────────────────
   # All listen TLS with the shared cache cert (client→cache hop, §11.5).
   # The original origin FQDN arrives as X-Orig-Host (set by the client
@@ -59,6 +55,7 @@ let
       error_page 301 302 303 307 308 = @follow_lfs;
       add_header X-Cache-Status $upstream_cache_status;
       add_header X-Cache-Upstream-Time $upstream_response_time;
+      access_log /var/log/nginx/${name}.log cache;
     ''; };
     # Content-addressed CDN payloads (LFS/OSS) → key on the original path,
     # signed query args dropped so the same file collapses to one entry.
@@ -76,6 +73,7 @@ let
       proxy_cache_valid 200 206 60d;
       proxy_cache_lock on;
       add_header X-Cache-Status $upstream_cache_status;
+      access_log /var/log/nginx/${name}.log cache;
     ''; };
   };
 
@@ -96,6 +94,7 @@ let
       proxy_cache_lock on;
       add_header X-Cache-Status $upstream_cache_status;
       add_header X-Cache-Upstream-Time $upstream_response_time;
+      access_log /var/log/nginx/${name}.log cache;
     ''; };
     # Manifests/tags → short TTL.
     "/" = { extraConfig = ''
@@ -111,6 +110,7 @@ let
       proxy_cache_valid 200 5m;
       add_header X-Cache-Status $upstream_cache_status;
       add_header X-Cache-Upstream-Time $upstream_response_time;
+      access_log /var/log/nginx/${name}.log cache;
     ''; };
   };
 
@@ -157,8 +157,14 @@ in
 
     # Cross-cutting proxy/cache state shared by both vhosts.
     appendHttpConfig = ''
-      proxy_cache_path /var/lib/cache/nginx/default levels=1:2
-        keys_zone=cache_default:100m max_size=40g inactive=30d use_temp_path=off;
+      # OCI cache split across two ZFS pools (focus-design §18.6): tiny,
+      # latency-critical manifests on the RAM-heavy cache-manifests pool;
+      # large immutable layers on the cache-blobs pool. The on-disk paths
+      # ARE the ZFS dataset mountpoints (modules/zfs-cache-pools.nix).
+      proxy_cache_path /var/lib/cache/nginx/manifests levels=1:2
+        keys_zone=cache_manifests:50m max_size=2g inactive=30d use_temp_path=off;
+      proxy_cache_path /var/lib/cache/nginx/blobs levels=1:2
+        keys_zone=cache_blobs:100m max_size=40g inactive=30d use_temp_path=off;
       proxy_cache_path /var/lib/cache/nginx/apt levels=1:2
         keys_zone=cache_apt:50m max_size=10g inactive=30d use_temp_path=off;
 
@@ -220,7 +226,7 @@ in
               proxy_ssl_name $upstream_host;
               proxy_set_header Host $upstream_host;
               proxy_set_header User-Agent "${c.userAgent}";
-              proxy_cache cache_default;
+              proxy_cache cache_blobs;
               proxy_cache_key $ckey;
               proxy_cache_valid 200 206 30d;
               proxy_cache_lock on;
@@ -229,6 +235,7 @@ in
               error_page 301 302 303 307 308 = @follow_cdn;
               add_header X-Cache-Status $upstream_cache_status;
               add_header X-Cache-Upstream-Time $upstream_response_time;
+              access_log /var/log/nginx/blobs.log cache;
             '';
           };
 
@@ -242,7 +249,7 @@ in
               proxy_ssl_name $upstream_host;
               proxy_set_header Host $upstream_host;
               proxy_set_header User-Agent "${c.userAgent}";
-              proxy_cache cache_default;
+              proxy_cache cache_manifests;
               proxy_cache_key $ckey;
               proxy_cache_valid 200 30d;
               proxy_cache_lock on;
@@ -251,6 +258,7 @@ in
               error_page 301 302 303 307 308 = @follow_cdn;
               add_header X-Cache-Status $upstream_cache_status;
               add_header X-Cache-Upstream-Time $upstream_response_time;
+              access_log /var/log/nginx/manifests.log cache;
             '';
           };
 
@@ -263,11 +271,13 @@ in
               proxy_pass $cdn_url;
               proxy_ssl_server_name on;
               proxy_set_header User-Agent "${c.userAgent}";
-              proxy_cache cache_default;
+              # CDN-redirected payloads are overwhelmingly blob bytes → blobs pool.
+              proxy_cache cache_blobs;
               proxy_cache_key $ckey;
               proxy_cache_valid 200 206 30d;
               proxy_cache_lock on;
               add_header X-Cache-Status $upstream_cache_status;
+              access_log /var/log/nginx/blobs.log cache;
             '';
           };
         };
@@ -297,6 +307,7 @@ in
               proxy_cache_valid 200 5m;
               add_header X-Cache-Status $upstream_cache_status;
               add_header X-Cache-Upstream-Time $upstream_response_time;
+              access_log /var/log/nginx/apt.log cache;
             '';
           };
 
@@ -310,6 +321,7 @@ in
               proxy_cache_valid 200 206 30d;
               add_header X-Cache-Status $upstream_cache_status;
               add_header X-Cache-Upstream-Time $upstream_response_time;
+              access_log /var/log/nginx/apt.log cache;
             '';
           };
         };
@@ -317,14 +329,14 @@ in
     } // modelVhosts // extraVhost;
   };
 
-  # Cache dirs on the data disk, owned by the nginx service user.
+  # Cache parents on the ext4 data disk. The per-workload leaf dirs
+  # (manifests/blobs/apt/extra/<model>) are ZFS dataset mountpoints created
+  # and chowned by modules/zfs-cache-pools.nix BEFORE nginx starts, so we
+  # only pre-create the parents here (the ZFS mounts land underneath).
   systemd.tmpfiles.rules = [
     "d /var/lib/cache 0755 nginx nginx - -"
     "d /var/lib/cache/nginx 0750 nginx nginx - -"
-    "d /var/lib/cache/nginx/default 0750 nginx nginx - -"
-    "d /var/lib/cache/nginx/apt 0750 nginx nginx - -"
-    "d /var/lib/cache/nginx/extra 0750 nginx nginx - -"
-  ] ++ modelTmpfiles;
+  ];
 
   # The NixOS nginx unit runs under ProtectSystem=strict, which makes the
   # whole FS read-only except /var/cache/nginx, /var/log/nginx, /run/nginx.

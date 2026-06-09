@@ -16,6 +16,8 @@ let
   c      = constants;
   pubKey = secrets.sshPubKey;   # string | null (needs cache-gen-secrets)
 
+  sh = import ./lib/sh-helpers.nix { inherit lib; };
+
   ubuntuNodes = builtins.attrNames c.ubuntuImages;
   nodeListMsg = builtins.concatStringsSep " " ubuntuNodes;
 
@@ -206,11 +208,7 @@ in
         echo "ERROR: unknown node '$NODE' (expected: ${nodeListMsg})" >&2
         exit 2
       fi
-      KEY="''${PWD}/secrets/ssh-ed25519"
-      if [[ ! -f "$KEY" ]]; then
-        echo "ERROR: $KEY not found. Run 'nix run .#cache-gen-secrets' first." >&2
-        exit 1
-      fi
+      ${sh.requireKey}
       mkdir -p "$PWD/ubuntu/$NODE"
       # shellcheck disable=SC2086
       exec ssh ${sshCommon "$NODE"} "ubuntu@$ip" "''${ARGS[@]}"
@@ -246,6 +244,95 @@ in
         rm -rf "''${PWD:?}/ubuntu/$NODE"
         echo "[$NODE] purged state dir"
       fi
+    '';
+  };
+
+  # ── bare-metal deploy (focus-design §16) ────────────────────────────────
+  # rsync THIS repo to a real Ubuntu box, copy ONLY the public cache CA cert,
+  # then run ubuntu/bootstrap.sh over SSH. Unlike up/ssh/down (libvirt lab
+  # guests) this targets an arbitrary --host using the operator's own SSH
+  # access. The rsync filter is the security boundary: default-deny secrets/,
+  # allow-list the single public cert — no private key ever transits.
+  deploy = pkgs.writeShellApplication {
+    name = "cache-ubuntu-deploy";
+    runtimeInputs = with pkgs; [ rsync openssh coreutils ];
+    # $DEST is expanded client-side ON PURPOSE — it is the deploy host's known
+    # destination path, identical on the remote, so SC2029 is a false positive.
+    excludeShellChecks = [ "SC2029" ];
+    text = ''
+      set -euo pipefail
+
+      HOST=""; DEST="/opt/cache-lab"; KEY=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --host=*) HOST="''${1#--host=}"; shift ;;
+          --dest=*) DEST="''${1#--dest=}"; shift ;;
+          --key=*)  KEY="''${1#--key=}";  shift ;;
+          --) shift ;;
+          *) echo "unknown arg: $1" >&2; exit 2 ;;
+        esac
+      done
+      if [[ -z "$HOST" ]]; then
+        echo "usage: cache-ubuntu-deploy -- --host=<user@addr> [--dest=/opt/cache-lab] [--key=<ssh key>]" >&2
+        exit 2
+      fi
+
+      # The PUBLIC cache CA cert is the one secret artifact the box needs and
+      # the only one we copy. Refuse to deploy without it.
+      CACHE_CA="''${PWD}/secrets/cache/ca/cache-CA.crt"
+      if [[ ! -f "$CACHE_CA" ]]; then
+        echo "ERROR: $CACHE_CA not found. Run 'nix run .#cache-gen-ca' in the lab first." >&2
+        exit 1
+      fi
+
+      # First-contact host keys go into a repo-local known_hosts (matches
+      # cache-ubuntu-ssh) so we neither prompt nor touch ~/.ssh. accept-new
+      # only ADDS unknown keys — a changed key still hard-fails.
+      KH="''${PWD}/ubuntu/deploy-known_hosts"
+      mkdir -p "''${PWD}/ubuntu"
+      COMMON=(-o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$KH")
+      if [[ -n "$KEY" ]]; then
+        # An explicit key: don't let the operator's agent shadow it.
+        unset SSH_AUTH_SOCK 2>/dev/null || true
+        COMMON+=(-i "$KEY" -o IdentitiesOnly=yes)
+      fi
+      SSH_OPTS=("''${COMMON[@]}")
+      # rsync -e takes one string; the lab repo path has no spaces.
+      RSH="ssh ''${COMMON[*]}"
+
+      # $DEST may live under a root-owned prefix (e.g. /opt); create it with
+      # sudo and hand it to the SSH user so rsync can write without root.
+      # (id -un/-gn expand on the REMOTE side — that is intentional.)
+      echo "→ preparing $DEST on $HOST (sudo mkdir + chown to ssh user)"
+      ssh "''${SSH_OPTS[@]}" "$HOST" \
+        "sudo mkdir -p '$DEST' && sudo chown \"\$(id -un):\$(id -gn)\" '$DEST'"
+
+      echo "→ rsync repo to $HOST:$DEST (excluding secrets/, .git, build artifacts)"
+      # --delete protects excluded paths, so a re-deploy keeps the box's
+      # already-minted MITM tree under secrets/<node>/.
+      # --no-specials/--no-devices: never transfer sockets/fifos (the lab leaves
+      # cache-*.sock VM control sockets in the repo root; nix chokes copying a
+      # socket into the store when it evaluates the flake from a non-git dir).
+      rsync -az --delete --no-specials --no-devices \
+        --exclude='secrets/' \
+        --exclude='.git/' \
+        --exclude='result*' \
+        --exclude='*.qcow2' \
+        --exclude='*.img' \
+        --exclude='*.sock' \
+        -e "$RSH" \
+        "''${PWD}/" "$HOST:$DEST/"
+
+      # A prior rsync may have left sockets behind (excludes protect them from
+      # --delete); sweep them so the flake evaluates cleanly.
+      ssh "''${SSH_OPTS[@]}" "$HOST" "find '$DEST' -xdev -type s -delete 2>/dev/null || true"
+
+      echo "→ copying ONLY the public cache CA cert (no private keys transit)"
+      ssh "''${SSH_OPTS[@]}" "$HOST" "mkdir -p '$DEST/secrets/cache/ca'"
+      rsync -az -e "$RSH" "$CACHE_CA" "$HOST:$DEST/secrets/cache/ca/cache-CA.crt"
+
+      echo "→ running bootstrap on $HOST"
+      ssh "''${SSH_OPTS[@]}" "$HOST" "sudo bash '$DEST/ubuntu/bootstrap.sh'"
     '';
   };
 }

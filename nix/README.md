@@ -11,11 +11,12 @@ pull-through caching of OCI images, apt packages, and LLM model files.
 | `cache0`  | cache  | shared OpenResty (OCI/apt/model vhosts) + Zot ×5 oracle + exporters |
 | `cache1`  | cache  | identical to `cache0` (interchangeable)                          |
 
-> **Status:** Phase 1 (boot-first scaffolding) is implemented — the three VMs
-> build, boot, and accept key-only SSH. The serving path (nginx caching, Zot
-> oracle, TLS hop) and MITM/model-store interception land in later phases. See
-> [`../docs/nix-design.md`](../docs/nix-design.md) for the full design and
-> [`../docs/focus-design/`](../docs/focus-design/) for *what* the fabric does.
+> **Status:** the lab boots and serves. The three MicroVMs build, boot, and accept
+> key-only SSH; the serving path (nginx two-tier caching, Zot oracle, client→cache
+> TLS hop), MITM/model-store interception, and **bare-metal Ubuntu clients** (via
+> [numtide/system-manager](https://github.com/numtide/system-manager)) are all
+> implemented. See [`../docs/nix-design.md`](../docs/nix-design.md) for the full
+> design and [`../docs/focus-design/`](../docs/focus-design/) for *what* the fabric does.
 
 ---
 
@@ -56,6 +57,30 @@ sudo nix run .#cache-network-teardown          # remove bridge + TAPs + NAT
 > `cache-network-setup` / `-teardown` need `sudo` (they touch host kernel
 > networking). Secrets are generated locally into `./secrets/` and are
 > **gitignored** — private keys never leave your machine.
+
+> **Why two `--` ?** `nix run .#cache-vm-ssh -- --node=cache0 -- uptime`: the
+> *first* `--` ends Nix's own arguments and starts the app's; the *second* ends
+> the app's flags (`--node=…`) and starts the command to run on the VM (`uptime`).
+
+---
+
+## How a pull flows (the 30-second mental model)
+
+A `docker pull` on a client never talks to the upstream registry directly:
+
+```
+docker/containerd  →  /etc/containerd/certs.d/<registry>/hosts.toml  (mirror rewrite)
+                   →  client nginx :8088   (local hot tier — LRU on the client)
+                   →  consistent-hash      (which shared cache owns this object?)
+                   →  cache0 / cache1 nginx (shared warm tier, TLS hop under the cache CA)
+                   →  upstream registry     (only on a cold miss)
+```
+
+The same fan-out serves apt packages and LLM model files (HuggingFace, ModelScope,
+PyTorch, Ollama) on their own nginx vhosts. HTTPS origins the lab needs to cache are
+**MITM-terminated** at a local listener (per-node CA, trusted into the system store);
+[`modules/`](modules/) holds one file per role in that path. Everything above is driven
+by [`constants.nix`](constants.nix) — change a port or upstream there, never in a module.
 
 ---
 
@@ -113,16 +138,41 @@ Apps are Linux-only (gated on `pkgs.stdenv.isLinux`).
 | `cache-network-setup`    |   **yes**  | create `cachebr0` + `cachetap0..2` (multi_queue + vhost-net) + NAT |
 | `cache-network-teardown` |   **yes**  | remove the bridge, TAPs, and NAT table                          |
 | `cache-gen-secrets`      |     no     | mint SSH host + user keys + `known_hosts` into `./secrets/`      |
+| `cache-gen-ca`           |     no     | mint the cache CA + per-client MITM trees into `./secrets/`; `-- --force` rotates; `-- --mitm-only --node=<name>` mints just one node's MITM tree (see below) |
 | `cache-start-all`        |     no     | build + boot `cache0`, `cache1`, then `client0` (skips running VMs) |
+| `cache-distribute-trust` |     no     | push the public cache CA cert to all clients over SSH and reload nginx |
 | `cache-vm-ssh`           |     no     | key-only SSH into a VM: `-- --node=<name> [-- <command>]`        |
 | `cache-vm-stop`          |     no     | stop one VM: `-- --node=<name>`                                  |
-| `cache-vm-wipe`          |     no     | stop a VM and delete its `*-data.img` (cold next boot): `-- --node=<name>` |
+| `cache-vm-wipe`          |     no     | stop a VM and delete its data disks (cold next boot): `-- --node=<name>` |
+| `cache-set-hc`           |     no     | toggle client active health-checking: `-- --state=on\|off`      |
+| `cache-diff-test`        |     no     | three-way probe (upstream vs nginx cache vs Zot oracle) asserting digests match |
+| `cache-load-loop`        |     no     | soak/hit-rate loop (pull → run → teardown → re-pull); tallies per-store `cs=HIT/MISS` from the §19 split access logs |
 
 `<name>` is one of `client0`, `cache0`, `cache1`.
 
-> More apps (`cache-gen-ca`, `cache-distribute-trust`, `cache-set-hc`,
-> `cache-render`, `cache-diff-test`, `cache-pull-corpus`,
-> `cache-observability-up`) arrive with the serving-path and MITM phases.
+> **`cache-gen-ca --mitm-only --node=<name>`** mints **only** a single node's MITM
+> tree, reusing a copied-in public `cache-CA.crt` (and never touching the cache CA
+> private key) — this is what the bare-metal Ubuntu bootstrap runs on the box. The
+> cache CA is lab-global (clients receive only its *public* cert, for the client→cache
+> TLS verify); each node's MITM CA is per-box and self-signed, so a box mints its own
+> offline. Re-run with `--force` to rotate; both paths are idempotent otherwise.
+
+### Ubuntu clients (libvirt VMs + bare metal)
+
+| app                    | what it does                                                       |
+|------------------------|-------------------------------------------------------------------|
+| `cache-ubuntu-up`      | boot a pinned Ubuntu cloud image under libvirt: `-- --node=ubuntu2404` |
+| `cache-ubuntu-ssh`     | SSH into an Ubuntu VM: `-- --node=<name> [-- <command>]`          |
+| `cache-ubuntu-down`    | destroy an Ubuntu VM: `-- --node=<name> [--purge]`               |
+| `cache-ubuntu-deploy`  | rsync this repo to a **real** Ubuntu box (excludes `secrets/`, copies only the public `cache-CA.crt`) and run `ubuntu/bootstrap.sh`: `-- --host=user@<box>` |
+
+Ubuntu clients reuse the same Nix modules as `client0` via
+[numtide/system-manager](https://github.com/numtide/system-manager). The verb that
+**applies** the config is `system-manager switch --flake .#ubuntu-client`, **not**
+`nix build` (which only realizes a store path and writes nothing to `/etc`). On a
+bare-metal box, `ubuntu/bootstrap.sh` does the full sequence (ensure Nix+Docker,
+`cache-gen-ca --mitm-only`, `system-manager switch`, restart docker); see
+[§16](../docs/focus-design/06-mitm-and-content.md#16-ubuntu-clients).
 
 ---
 
@@ -130,17 +180,37 @@ Apps are Linux-only (gated on `pkgs.stdenv.isLinux`).
 
 | file                          | purpose                                                        |
 |-------------------------------|----------------------------------------------------------------|
-| `constants.nix`               | single source of truth: IPs/MACs/ports/upstreams/sizes + helpers |
+| `constants.nix`               | single source of truth: merges `constants/*.nix` into one flat namespace (a lazy `self` fixpoint) |
+| `constants/network.nix`       | node sets, dual-stack IP/MAC/tap topology, upstream OCI registries |
+| `constants/images.nix`        | pinned Ubuntu cloud-image releases (isolated — the only time-sensitive data) |
+| `constants/app.nix`           | port map, upstream User-Agent, health-check tunables, apt mirrors, model stores |
+| `constants/security.nix`      | cache-CA TLS config + per-client MITM cert groups (derived from model stores) |
+| `constants/resources.nix`     | console ports, vcpu/mem, full ZFS pool layout + ARC/L2ARC/ZIL tuning |
+| `sysctl-values.nix`           | kernel/network tuning *data* (shared by the NixOS module + the Ubuntu drop-in) |
 | `nodes.nix`                   | node registry → which generator the flake uses per VM           |
-| `microvm-cache.nix`           | cache-VM generator (`nixosSystem` → `declaredRunner`)          |
-| `microvm-client.nix`          | client-VM generator (same scaffolding, client resources)       |
+| `lib/mk-microvm-node.nix`     | shared MicroVM scaffold (boot/SSH/networkd/ZFS/observability) both roles build on |
+| `lib/mitm-hosts.nix`          | the one builder for the MITM `/etc/hosts` block (NixOS + Ubuntu agree by construction) |
+| `lib/render-sysctl.nix`       | renders `sysctl-values.nix` to `/etc/sysctl.d` drop-in text (Ubuntu path) |
+| `lib/sh-helpers.nix`          | shared shell snippets for the lifecycle apps (`requireKey`/`sshOpts`/`noKnownHosts`) |
+| `microvm-cache.nix`           | cache-VM role descriptor (feature modules + cache-cert install) → `mk-microvm-node` |
+| `microvm-client.nix`          | client-VM role descriptor (feature modules + cache-CA/MITM activation) → `mk-microvm-node` |
+| `ubuntu-vm.nix`               | Ubuntu client apps (`up`/`ssh`/`down`/`deploy`) — libvirt VMs + bare-metal deploy |
+| `ubuntu-client.nix`           | system-manager config for Ubuntu clients (imports `modules/nginx-client.nix`) |
 | `secrets.nix`                 | null-able reads of `./secrets/` (flake evaluates if absent)     |
-| `secrets-gen.nix`             | offline secret generators (the `cache-gen-secrets` app)         |
-| `network-setup.nix`           | host bridge + TAP + NAT apps                                    |
-| `microvm-scripts.nix`         | VM lifecycle apps (start/ssh/stop/wipe)                         |
+| `secrets-gen.nix`             | offline secret generators (`cache-gen-secrets`, `cache-gen-ca`) |
+| `network-setup.nix`           | host bridge + TAP + NAT apps (`cache-check-host`/`-network-setup`/`-teardown`) |
+| `microvm-scripts.nix`         | VM lifecycle + ops apps (start-all, vm-ssh/stop/wipe, distribute-trust, set-hc, diff-test, load-loop) |
+| `ca-injector-wrapper.nix`     | shared runc-wrapper derivation that bind-mounts the MITM CA into containers (used by NixOS + Ubuntu) |
 | `shell.nix`                   | the dev shell                                                   |
-| `modules/sysctls.nix`         | kernel / network tuning (shared by client + cache)             |
-| `modules/observability.nix`   | Prometheus node_exporter                                        |
+| `modules/nginx-cache.nix`     | shared cache nginx: OCI/apt/model vhosts, proxy_cache zones, `@follow_*` LFS/CDN |
+| `modules/nginx-client.nix`    | client nginx: local hot tier + consistent-hash to the caches + in-process HC lua |
+| `modules/docker-client.nix`   | dockerd + containerd config: registry mirror + `certs.d` hosts.toml routing |
+| `modules/mitm.nix`            | `/etc/hosts` poisoning so host tools hit the local MITM listener |
+| `modules/ca-injector.nix`     | wires the runc CA-injector wrapper into the docker daemon (per-container CA trust) |
+| `modules/zot-oracle.nix`      | the ×5 Zot registries used as the cache-transparency oracle    |
+| `modules/observability.nix`   | Prometheus node_exporter + nginx exporter; §19 `log_format cache` (per-store access logs) |
+| `modules/sysctls.nix`         | applies `sysctl-values.nix` via `boot.kernel.sysctl` (NixOS only) |
+| `modules/zfs-cache-pools.nix` | the one proper NixOS module (`options.cacheZfs`): hot/warm ZFS pool layout |
 
 ---
 

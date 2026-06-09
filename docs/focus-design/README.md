@@ -64,6 +64,7 @@ The focused design is split across the documents below. Section numbers are pres
 **[Overview, end-to-end flows, and requirements](01-overview.md)**
 
 - [§3 Overview](01-overview.md#3-overview)
+  - [§3.1 Background: container images live on the host, and they pile up](01-overview.md#31-background-container-images-live-on-the-host-and-they-pile-up)
 - [§4 End-to-end flows](01-overview.md#4-end-to-end-flows)
   - [§4.1 OCI container pull (`docker pull`)](01-overview.md#41-oci-container-pull-docker-pull)
   - [§4.2 apt update and apt install](01-overview.md#42-apt-update-and-apt-install)
@@ -81,6 +82,7 @@ The focused design is split across the documents below. Section numbers are pres
   - [§7.2 What nginx-only must replicate by hand](02-caching-design.md#72-what-nginx-only-must-replicate-by-hand)
   - [§7.3 Why nginx-only is still attractive](02-caching-design.md#73-why-nginx-only-is-still-attractive)
   - [§7.4 The committed design: nginx cache, Zot as verification oracle](02-caching-design.md#74-the-committed-design-nginx-cache-zot-as-verification-oracle)
+  - [§7.5 Revisit: would Zot-in-path be better?](02-caching-design.md#75-revisit-would-zot-in-path-be-better)
 
 **[Repository layout, network topology, and constants](03-architecture.md)**
 
@@ -106,6 +108,7 @@ The focused design is split across the documents below. Section numbers are pres
 
 - [§13 Cache VMs: nginx primary and Zot oracle](05-cache-vms.md#13-cache-vms-nginx-primary-and-zot-oracle)
   - [§13.1 Zot (verification oracle)](05-cache-vms.md#131-zot-verification-oracle)
+  - [§13.1.1 What Zot's sync rewrites (and why it matters)](05-cache-vms.md#1311-what-zots-sync-rewrites-and-why-it-matters)
   - [§13.2 nginx wildcard OCI catch-all](05-cache-vms.md#132-nginx-wildcard-oci-catch-all)
   - [§13.3 nginx apt cache](05-cache-vms.md#133-nginx-apt-cache)
   - [§13.4 Docker Hub CDN handling](05-cache-vms.md#134-docker-hub-cdn-handling)
@@ -133,6 +136,9 @@ The focused design is split across the documents below. Section numbers are pres
   - [§18.3 QUIC / HTTP3 tuning](07-tuning-observability.md#183-quic--http3-tuning)
   - [§18.4 Lua health-check tuning](07-tuning-observability.md#184-lua-health-check-tuning)
   - [§18.5 Zot tuning](07-tuning-observability.md#185-zot-tuning)
+  - [§18.6 Storage and filesystem tuning (ZFS cache pools)](07-tuning-observability.md#186-storage-and-filesystem-tuning-zfs-cache-pools)
+  - [§18.7 ARC, L2ARC and ZIL strategy](07-tuning-observability.md#187-arc-l2arc-and-zil-strategy)
+  - [§18.8 Recommended cache sizes (grounded in the fleet image audit)](07-tuning-observability.md#188-recommended-cache-sizes-grounded-in-the-fleet-image-audit)
 - [§19 Observability (Prometheus)](07-tuning-observability.md#19-observability-prometheus)
 
 **[Build, measurement, alternatives, and future work](08-operations.md)**
@@ -141,3 +147,5 @@ The focused design is split across the documents below. Section numbers are pres
 - [§21 What we measure](08-operations.md#21-what-we-measure)
 - [§22 Alternatives considered: client-side proxy](08-operations.md#22-alternatives-considered-client-side-proxy)
 - [§23 Future work](08-operations.md#23-future-work)
+- [§24 Local container-image lifecycle on cache clients](08-operations.md#24-local-container-image-lifecycle-on-cache-clients)
+  - [§24.1 Background: the SOCI snapshotter (lazy image loading)](08-operations.md#241-background-the-soci-snapshotter-lazy-image-loading)

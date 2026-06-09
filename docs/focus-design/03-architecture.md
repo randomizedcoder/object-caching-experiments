@@ -30,13 +30,12 @@ object-caching-experiments/
 │   │   ├── sysctls.nix             # kernel network tuning (shared by client + cache)
 │   │   └── observability.nix       # node_exporter + nginx exporter
 │   └── shell.nix                   # dev shell (openresty, curl, jq, regctl, crane)
-├── ansible/
-│   └── roles/                      # ubuntu: docker, nginx-client (openresty), mitm-trust, node_exporter, hosts.toml, sysctls
+├── ubuntu/                         # ubuntu clients: cloud-init seeds (per release) + bootstrap.sh (bare-metal on-box apply)
 ├── secrets/                        # ssh keys + per-client internal CA + per-FQDN certs (secrets/<client>/{ca,mitm}/)
 └── rendered/                       # generated config snapshots for inspection
 ```
 
-Two microvm generators (`microvm-client.nix`, `microvm-cache.nix`) mirror the dual-generator pattern in `ceph-on-k8s`. `flake.nix` walks `nodes.nix` and emits one `packages.x86_64-linux.cache-microvm-<name>` per VM. The Ubuntu clients are provisioned by Vagrant+libvirt and configured by Ansible (see [§16](06-mitm-and-content.md#16-ubuntu-clients)); the same logical config (containerd `hosts.toml`, client OpenResty with in-process Lua health-checks, MITM trust, sysctls, node_exporter) is expressed twice — NixOS modules for `client0`, Ansible roles for the Ubuntu boxes — and must produce semantically equivalent end state.
+Two microvm generators (`microvm-client.nix`, `microvm-cache.nix`) mirror the dual-generator pattern in `ceph-on-k8s`. `flake.nix` walks `nodes.nix` and emits one `packages.x86_64-linux.cache-microvm-<name>` per VM. The Ubuntu clients reuse the **same Nix modules** as `client0` via [numtide/system-manager](https://github.com/numtide/system-manager) — cloud-init installs Nix and `system-manager switch --flake .#ubuntu-client` applies `nix/ubuntu-client.nix`, which imports `modules/nginx-client.nix` verbatim and renders the rest (sysctls, exporters, docker/containerd config, MITM trust) as `systemd.services` + `environment.etc` (see [§16](06-mitm-and-content.md#16-ubuntu-clients)). There is **no Ansible**: the same logical config (containerd `hosts.toml`, client OpenResty with in-process Lua health-checks, MITM trust, sysctls, node_exporter) is driven from one `constants.nix` source of truth across NixOS and Ubuntu.
 
 The detailed Nix implementation design — the small `flake.nix`, every `nix/` module, the two microvm generators, and the secrets/CA + host-networking + VM-lifecycle apps — lives in [`../nix-design.md`](../nix-design.md). This section is the contract it realizes; that doc is the how.
 

@@ -25,9 +25,9 @@ let
 
   # Same tuning the NixOS VMs get via boot.kernel.sysctl (modules/sysctls.nix),
   # rendered to a drop-in since system-manager ignores boot.kernel.sysctl.
-  sysctlValues = import ./sysctl-values.nix;
-  sysctlConf = lib.concatStringsSep "\n"
-    (lib.mapAttrsToList (k: v: "${k} = ${toString v}") sysctlValues) + "\n";
+  sysctlConf = import ./lib/render-sysctl.nix {
+    inherit lib; values = import ./sysctl-values.nix;
+  };
 
   # Per-FQDN leaf crt/key this client's nginx :443 loads (§14.2). One per
   # mitmCertGroups entry, from client0's reused MITM tree. Empty until
@@ -48,7 +48,7 @@ let
   # host tools hit the local nginx :443. (Containers get the LAN IP instead,
   # via ca-injector below.) system-manager has no networking.extraHosts, so
   # the cache-trust oneshot below maintains a marked block in /etc/hosts.
-  hostsBlock = lib.concatMapStringsSep "\n" (f: "127.0.0.1 ${f}") c.mitmAllFqdns;
+  hostsBlock = import ./lib/mitm-hosts.nix { inherit lib; fqdns = c.mitmAllFqdns; };
 
   # Space-separated MITM FQDNs for the runtime container-hosts generator.
   mitmFqdnList = lib.concatStringsSep " " c.mitmAllFqdns;
@@ -251,6 +251,12 @@ in
     description = "Install MITM CA trust + /etc/hosts poisoning";
     wantedBy   = [ "multi-user.target" ];
     before     = [ "nginx.service" ];
+    # RemainAfterExit oneshots are NOT re-run on switch when only a file they
+    # READ changes (the unit text is identical). Mint a fresh MITM CA on the
+    # box and the trust store would keep the stale one. Pin the CA (+ hosts
+    # block) into X-Restart-Triggers so the unit hash changes with the content,
+    # which is what makes the activation actually re-run this on a CA rotation.
+    restartTriggers = (lib.optional (mitm != null) mitm.ca) ++ [ hostsBlock ];
     serviceConfig = {
       Type            = "oneshot";
       RemainAfterExit = true;
