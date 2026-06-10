@@ -8,6 +8,28 @@
 let
   constants = import ./constants.nix;
 
+  # Patched containerd: adds the `dial_addr` hosts.toml field so the OCI pull
+  # hop reaches the client nginx over a Unix domain socket instead of loopback
+  # TCP (fork randomizedcoder/containerd#1). Pinned by commit rev; vendorHash
+  # stays null (the fork's committed vendor/ is unchanged). The REVISION/VERSION
+  # swap makes `containerd --version` report the fork — positive deploy proof.
+  containerdOverlay = final: prev: {
+    containerd = prev.containerd.overrideAttrs (old: {
+      version = "2.2.1-uds";
+      src = prev.fetchFromGitHub {
+        owner = "randomizedcoder";
+        repo  = "containerd";
+        rev   = "fa814b150932cbc80dc6ce9a123c34837d27b430";
+        hash  = "sha256-UXRSWriWU4ZnRWjVr0E4I8e2iGlAMdMoA3WvEQXtERA=";
+      };
+      makeFlags =
+        (builtins.filter
+          (f: !(lib.hasPrefix "REVISION=" f || lib.hasPrefix "VERSION=" f))
+          old.makeFlags)
+        ++ [ "REVISION=fa814b150932cbc80dc6ce9a123c34837d27b430" "VERSION=v2.2.1-uds" ];
+    });
+  };
+
   # Per-FQDN leaf certs this client's nginx :443 loads (§14.2/§14.3). One
   # per mitmCertGroups entry, signed by this client's own MITM CA. Empty
   # until cache-gen-ca has run (mitm == null).
@@ -30,6 +52,9 @@ import ./lib/mk-microvm-node.nix {
   ];
 
   extraConfig = {
+    # ── patched containerd (UDS dial_addr, §12) ───────────────────────
+    nixpkgs.overlays = [ containerdOverlay ];
+
     # ── cache CA public cert (no-op while cacheCa == null) ─────────────
     system.activationScripts.cache-ca = lib.optionalString (cacheCa != null) ''
       install -d -m 0755 /etc/nginx

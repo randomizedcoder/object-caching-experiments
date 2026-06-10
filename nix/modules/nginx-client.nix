@@ -184,10 +184,15 @@ in
     '';
 
     virtualHosts = {
-      # ── OCI frontend (:8088) — containerd hosts.toml target ───────────
+      # ── OCI frontend (:8088 + UDS) — containerd hosts.toml target ─────
+      # containerd dials the Unix socket (patched dial_addr); the TCP
+      # listener is retained for the not-built arbitrary-origin redirect.
       "client-oci" = {
         default = true;
-        listen  = [{ addr = "0.0.0.0"; port = c.ports.clientOci; }];
+        listen  = [
+          { addr = "0.0.0.0"; port = c.ports.clientOci; }
+          { addr = "unix:${c.socks.clientOci}"; }
+        ];
         extraConfig = ''
           # Per-tier cache + latency headers, inherited by both locations.
           add_header X-Cache-Hot  $upstream_cache_status;   # local hot-tier HIT/MISS
