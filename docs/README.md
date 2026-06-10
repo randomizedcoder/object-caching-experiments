@@ -34,6 +34,9 @@ tested on a single host.
 
 ## See also
 
+- **[`container-mitm-arbitrary-origins.md`](container-mitm-arbitrary-origins.md)** — a
+  forward-looking **exploration** (not built): how the curated-FQDN container MITM of §05 *could* be
+  generalised to arbitrary origins via nftables DNAT + on-the-fly certs.
 - **[`../README.md`](../README.md)** — the repository landing page (problem statement, headline
   diagram, repo map).
 - **[`../nix/README.md`](../nix/README.md)** — the operational run guide: the full set of

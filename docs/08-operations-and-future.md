@@ -44,9 +44,37 @@ lock-step. This is what proves the client config is portable off the lab and ont
 Everything below is **deliberately not implemented**. It is recorded here so the boundary between
 the working lab and the roadmap is unambiguous. Do not read these as present-tense behaviour.
 
-- **SOCI / lazy-loading snapshotter.** Today a pull still transfers whole layers. A lazy-loading
-  snapshotter (SOCI) would let containers start before every byte lands, fetching layer ranges on
-  demand through the same cache. **Not built.**
+- **SOCI / lazy-loading snapshotter.** Today the client runs the eager **overlayfs** containerd
+  snapshotter (`features.containerd-snapshotter = true`,
+  [`docker-client.nix`](../nix/modules/docker-client.nix)): a pull transfers and unpacks *whole*
+  layers before the container starts. A **lazy-loading** snapshotter would instead mount each layer
+  as a FUSE filesystem and fetch only the spans a container actually reads, on demand, through the
+  same cache — collapsing both startup wait and local footprint toward the real working set. The
+  leading fit is **SOCI** (Seekable OCI, AWS Labs): it leaves the image **byte-for-byte unmodified**
+  and adds a *separate* index artifact (discovered via the Referrers API
+  `/v2/<name>/referrers/<digest>`), so digest-dedup and the byte-identical guarantee survive — the
+  decisive advantage over **eStargz/stargz**, which repackage layers, change digests, and break both.
+  SOCI is also fail-safe: no index → it falls back to overlayfs and pulls normally.
+
+  The challenges that make this a real project, not a config flip:
+  - **Range-blob caching is new serving surface.** SOCI's on-demand reads are HTTP `Range` GETs
+    against blob URLs (`fs/remote/resolver.go`), so the nginx cache must serve and cache `206`
+    partial content correctly (`slice` module, range-aware cache keys) without caching partials
+    wrong or thrashing — and the Zot oracle's byte-identical check must extend to ranged reads.
+  - **Index availability is the binding constraint for *our* workload.** Lazy loading only helps
+    images that *have* a SOCI index. The third-party RunPod / Docker Hub images we pull almost
+    certainly ship none → eager fallback → zero benefit. Closing that gap means either upstream runs
+    `soci create`/push (out of our control) or **the cache synthesizes indices on ingest** — itself
+    a substantial feature.
+  - **Registry-path requirements.** The path must support the Referrers API (or the tag-scheme
+    fallback) and honour ranged blob reads, end to end through the cache.
+  - **Operational surface.** An extra `soci-snapshotter-grpc` daemon per client plus a containerd
+    config stanza.
+
+  Mostly **orthogonal to the MITM design**: lazy delivery doesn't change CA injection (bind mounts
+  are honoured regardless of snapshotter), but it does make any *create-time* rootfs inspection even
+  less viable (the FUSE rootfs materializes on access) — see
+  [`container-mitm-arbitrary-origins.md`](container-mitm-arbitrary-origins.md). **Not built.**
 - **Local image garbage collection.** A policy for evicting cold images from the client's local
   store to bound disk use. **Not built.**
 - **Node-to-node HTTP/3 on the client→cache hop.** The cache hop is HTTP/2 over TLS today; HTTP/3

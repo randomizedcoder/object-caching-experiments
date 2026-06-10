@@ -228,7 +228,21 @@ in
         "docker.io|runpod/pytorch|2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04|5050"
         "docker.io|runpod/pytorch|2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04|5050"
         "docker.io|runpod/comfyui|latest|5050"
+        "docker.io|runpod/pytorch|1.0.2-cu1281-torch280-ubuntu2404|5050"
+        "docker.io|vllm/vllm-openai|latest|5050"
+        "docker.io|ollama/ollama|latest|5050"
       )
+
+      # FUTURE — compiled-kernel GPU accelerators. NOT added to the corpus above
+      # because they are not OCI images and the cache does not intercept their
+      # origins today; they arrive over PyPI / GitHub-release / git, which is the
+      # arbitrary-origin MITM design (NOT built) in
+      # docs/container-mitm-arbitrary-origins.md ("Worked example: accelerator
+      # fetch surfaces"). Anchored here so the test corpus to add lands beside the
+      # OCI one once interception (or a PyPI/git mirror) exists:
+      #   pypi.org    triton, accelerate           wheels  (files.pythonhosted.org)
+      #   github.com  dao-ailab/flash-attention     release .whl (objects.githubusercontent.com)
+      #   github.com  thu-ml/sageattention          git clone (smart-HTTP)
 
       # ns → real upstream base URL (from constants.upstreams).
       upstream_url() {
@@ -332,7 +346,7 @@ in
       PAUSE_SECS=30
       CYCLES=0
       REPORT_NODES="client0,${builtins.concatStringsSep "," constants.cacheNames}"
-      IMAGES="registry.k8s.io/pause:3.9 registry.k8s.io/coredns/coredns:v1.11.1 gcr.io/distroless/static:latest alpine:latest ghcr.io/astral-sh/uv:latest runpod/flash:latest runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04 runpod/comfyui:latest"
+      IMAGES="registry.k8s.io/pause:3.9 registry.k8s.io/coredns/coredns:v1.11.1 gcr.io/distroless/static:latest alpine:latest ghcr.io/astral-sh/uv:latest runpod/flash:latest runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04 runpod/comfyui:latest runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 vllm/vllm-openai:latest ollama/ollama:latest"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --node=*)         NODE="''${1#*=}" ;;

@@ -75,3 +75,8 @@ Two design choices make this safe:
 
 The same shim is shared with the Ubuntu clients — it references only fixed `/etc` paths, so it is
 node-agnostic.
+
+Everything above is keyed on a **known FQDN** (an `/etc/hosts` line, a pre-minted leaf). Generalising
+container MITM to *arbitrary* origins — packet-layer redirection (nftables DNAT) plus on-the-fly
+certs — is explored, **but not built**, in
+[`container-mitm-arbitrary-origins.md`](container-mitm-arbitrary-origins.md).
