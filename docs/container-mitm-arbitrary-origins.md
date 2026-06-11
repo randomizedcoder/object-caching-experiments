@@ -28,8 +28,8 @@ has now been removed and one remains:
   SNIs that were never declared up front. So the cert half is already hostname-agnostic.
 
 So intercepting an origin you *cannot enumerate up front* — the realistic case for arbitrary
-container workloads (a RunPod image may `pip install`, `git clone`, or fetch weights from dozens of
-hosts) — now turns on making the **redirection** half hostname-agnostic
+container workloads (an AI/ML image, such as one of RunPod's, may `pip install`, `git clone`, or
+fetch weights from dozens of hosts) — now turns on making the **redirection** half hostname-agnostic
 too. That is the remaining thesis of this doc, and the lens for the redirection sections below.
 
 ## The three pieces that would have to change
@@ -310,8 +310,8 @@ the *snapshotter* — even a Rust shim cannot reliably read the merged rootfs at
 
 Everything above is about *interception* — getting the bytes off the wire. The moment "arbitrary
 origins" includes a **private** registry it surfaces a separate axis the curated allowlist never
-touched: **authorization**. The model stores §05 MITMs are anonymous public reads; but the usage
-data shows containers pulling from `registry.runpod.net`, which answers
+touched: **authorization**. The model stores §05 MITMs are anonymous public reads; but in practice
+a GPU-cloud fleet also pulls from private registries (for example `registry.runpod.net`) that answer
 an anonymous manifest request with `401`. A cache that has terminated the client's TLS now holds a decrypted,
 *unauthenticated* request for content it may already have on disk. It must not simply serve those
 bytes — that would turn the cache into an authorization bypass, handing any tenant another tenant's

@@ -217,6 +217,10 @@ in
         exit 1
       fi
 
+      # Representative public AI images used to exercise the cache end-to-end.
+      # RunPod's public images are one example set among others (vLLM, Ollama, …);
+      # an operator substitutes their own fleet's images here. Do not edit casually:
+      # these digests are what cache-diff-test proves byte-identical.
       # reg|repo|tag|zotPort
       corpus=(
         "registry.k8s.io|pause|3.9|5054"
@@ -537,6 +541,8 @@ in
       PAUSE_SECS=30
       CYCLES=0
       REPORT_NODES="client0,${builtins.concatStringsSep "," constants.cacheNames}"
+      # Representative public AI images used to load the cache; RunPod's public
+      # images are one example set — an operator substitutes their own fleet here.
       IMAGES="registry.k8s.io/pause:3.9 registry.k8s.io/coredns/coredns:v1.11.1 gcr.io/distroless/static:latest alpine:latest ghcr.io/astral-sh/uv:latest runpod/flash:latest runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04 runpod/comfyui:latest runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 vllm/vllm-openai:latest ollama/ollama:latest"
       while [[ $# -gt 0 ]]; do
         case "$1" in

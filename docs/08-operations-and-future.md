@@ -61,9 +61,9 @@ the working lab and the roadmap is unambiguous. Do not read these as present-ten
     against blob URLs (`fs/remote/resolver.go`), so the nginx cache must serve and cache `206`
     partial content correctly (`slice` module, range-aware cache keys) without caching partials
     wrong or thrashing — and the Zot oracle's byte-identical check must extend to ranged reads.
-  - **Index availability is the binding constraint for *our* workload.** Lazy loading only helps
-    images that *have* a SOCI index. The third-party RunPod / Docker Hub images we pull almost
-    certainly ship none → eager
+  - **Index availability is the binding constraint for a typical workload.** Lazy loading only helps
+    images that *have* a SOCI index. The third-party AI images an operator pulls (public Docker Hub
+    images, a GPU-cloud platform's own images such as RunPod's) almost certainly ship none → eager
     fallback → zero benefit. Closing that gap means either upstream runs
     `soci create`/push (out of our control) or **the cache synthesizes indices on ingest** — itself
     a substantial feature.

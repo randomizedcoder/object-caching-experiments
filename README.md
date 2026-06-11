@@ -30,6 +30,12 @@ the right locality**:
 The aim is to push the hit-rate as high as possible at tier 1, catch the rest at tier 2, and
 drive WAN egress toward zero — so container cold-start approaches local-disk speed.
 
+The design is **generic**: any operator running a datacenter of container hosts can adopt it,
+whatever the workload. RunPod images appear throughout these docs and tests only as one concrete
+**example** fleet — a stand-in for "a large AI/ML container workload" — alongside vLLM, Ollama,
+and the model stores. Substitute your own images and origins and the same two-tier caching
+applies unchanged.
+
 **This repository is a scaled-down, end-to-end working model of that target.** Instead of 500
 clients it runs a handful (one NixOS client + three Ubuntu clients) against **two** shared cache
 machines, all on an isolated virtual network, so the whole design can be built, booted, and
