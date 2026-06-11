@@ -31,10 +31,11 @@ All GitHub links are pinned to commit
 
 ## Executive summary: top 10 recommendations
 
-Ranked by expected impact on the actual RunPod workload (huge AI/ML
-images, GPU nodes, 1 TB+ image working sets), as observed on
-`run-pod-65` (Docker 29.3.0, legacy `overlay2` graphdriver, `userns-remap:
-default`, no `containerd-snapshotter` flag set).
+Ranked by expected impact on a representative large AI/ML container fleet
+(huge AI/ML images, GPU nodes, 1 TB+ image working sets), measured here on a
+real example host (a RunPod GPU host, `run-pod-65`: Docker 29.3.0, legacy
+`overlay2` graphdriver, `userns-remap: default`, no `containerd-snapshotter`
+flag set).
 
 Ordered for sequencing: #1-#2 are operational wins deployable in days,
 #3 is the cold-start killer (requires #2), #4 is the structural long-
@@ -78,7 +79,7 @@ dockerd via `daemon.json` and SIGHUP-reload
 | [Sonatype Nexus Repository OSS](https://www.sonatype.com/products/sonatype-nexus-repository) | EPL, free OSS tier | If you already run Nexus for Maven / npm / PyPI - one product covers them all. Docker proxy works fine. |
 | [Zot](https://zotregistry.dev) | Apache 2.0, CNCF sandbox | Modern OCI-native, single static binary, no DB. Newer than `distribution` but well-maintained and good for greenfield. |
 
-For RunPod specifically, **`distribution` in `proxy:` mode** is the
+For a GPU-cloud operator specifically, **`distribution` in `proxy:` mode** is the
 right starting point. It's the reference impl, the storage tiers are
 boringly stable, and the only "feature" you need is the cache. You can
 add Harbor later if you want vuln scanning or replication; you can
@@ -445,7 +446,7 @@ this turns cold-start into zero start.
 **Expected win.** For the prewarmed image set: ∞x (zero cold start).
 For everything else: nothing. So the win scales with how concentrated
 your image popularity distribution is - if 10 images account for 80%
-of starts (likely the case for RunPod's worker images), prewarming
+of starts (as in the example fleet's worker images), prewarming
 those 10 covers 80% of cold-start latency.
 
 **Downsides and risks.**
@@ -641,7 +642,7 @@ multiplied by #1, so the actual minimum-viable bundle is **#1 + #2 +
   - [Rollback](#rollback)
   - [Tradeoffs - what you gain](#tradeoffs---what-you-gain)
   - [Tradeoffs - what you lose / pay attention to](#tradeoffs---what-you-lose--pay-attention-to)
-  - [Concrete enablement plan for the RunPod fleet](#concrete-enablement-plan-for-the-runpod-fleet)
+  - [Concrete enablement plan for a GPU-cloud fleet (RunPod as the worked example)](#concrete-enablement-plan-for-a-gpu-cloud-fleet-runpod-as-the-worked-example)
   - [Pre-flight checklist](#pre-flight-checklist)
 - [11. Where I'd benchmark first](#11-where-id-benchmark-first)
 
@@ -2151,7 +2152,7 @@ D. **Stargz / Nydus lazy-loading snapshotters:**
 
 ## 9. Production context: very large AI/ML images and what that changes
 
-Sample from a real RunPod GPU host (`run-pod-65`, 2026-06):
+Sample from a real GPU host in the example fleet (a RunPod host, `run-pod-65`, 2026-06):
 
 ```
 $ docker system df
@@ -2280,8 +2281,8 @@ For a known set of images deployed to a known set of nodes, the
 fastest "cold start" is **no cold start**. Approaches:
 
 1. **Bake the image into the node OS** at provisioning time (e.g.
-   in your AMI / cloud-init / Packer build). For RunPod's predictable
-   workloads this is realistic; pre-pull the top 10 most-used images.
+   in your AMI / cloud-init / Packer build). For a fleet with predictable
+   workloads (as in the example fleet) this is realistic; pre-pull the top 10 most-used images.
    Cold-start time drops to zero.
 2. **Pre-pull from a node-local daemon** at boot:
    `systemd-run --on-boot docker pull runpod/pytorch:...`.
@@ -2394,7 +2395,7 @@ your images are built.
 | Subtle differences in image listing | The two image stores have slightly different semantics around "image" vs "manifest digest". Mostly invisible. |
 | Restart required | Cannot toggle live, requires `dockerd` restart and may run migration on first boot. |
 
-### Concrete enablement plan for the RunPod fleet
+### Concrete enablement plan for a GPU-cloud fleet (RunPod as the worked example)
 
 Given the production state you described, I'd do this in phases:
 

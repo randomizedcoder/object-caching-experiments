@@ -30,6 +30,12 @@ the right locality**:
 The aim is to push the hit-rate as high as possible at tier 1, catch the rest at tier 2, and
 drive WAN egress toward zero — so container cold-start approaches local-disk speed.
 
+The design is **generic**: any operator running a datacenter of container hosts can adopt it,
+whatever the workload. RunPod images appear throughout these docs and tests only as one concrete
+**example** fleet — a stand-in for "a large AI/ML container workload" — alongside vLLM, Ollama,
+and the model stores. Substitute your own images and origins and the same two-tier caching
+applies unchanged.
+
 **This repository is a scaled-down, end-to-end working model of that target.** Instead of 500
 clients it runs a handful (one NixOS client + three Ubuntu clients) against **two** shared cache
 machines, all on an isolated virtual network, so the whole design can be built, booted, and
@@ -136,8 +142,9 @@ while passive checks remain.
 
 **Transparent interception for *unmodified* containers.** A hard requirement is that an external
 user's Dockerfile and `docker pull` must work **as-is** — no edits. The lab achieves this with
-containerd `certs.d` `hosts.toml` routing, `/etc/hosts` redirection, a per-client MITM CA with
-per-FQDN leaf certs, and a runc CA-injector that bind-mounts trust into containers. Pulls and
+containerd `certs.d` `hosts.toml` routing, `/etc/hosts` redirection, a per-client MITM CA whose
+leaves are minted on the fly per SNI inside nginx, and a runc CA-injector that bind-mounts trust
+into containers. Pulls and
 in-build downloads transparently route through the cache without anyone changing their build.
 → [`05-trust-and-mitm.md`](docs/05-trust-and-mitm.md), [`03-client.md`](docs/03-client.md) §3.6.
 

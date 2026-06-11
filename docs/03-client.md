@@ -91,7 +91,16 @@ server = "https://gcr.io"            # final fallback: cache down → pull direc
 
 [host."http://127.0.0.1:8088"]       # the client nginx OCI frontend
   capabilities = ["pull", "resolve"]
+  dial_addr = "unix:///run/nginx/cache-oci.sock"   # dial nginx over a Unix socket, not loopback TCP
 ```
+
+The `dial_addr` field swaps only the *transport*: the request still targets `127.0.0.1:8088`
+(unchanged `Host:`), but containerd dials the Unix socket — skipping the loopback TCP/IP stack,
+which matters under load at scale. It needs a patched containerd
+([`randomizedcoder/containerd#1`](https://github.com/randomizedcoder/containerd/pull/1)), built via
+a rev-pinned overlay in [`microvm-client.nix`](../nix/microvm-client.nix). nginx still keeps its
+`:8088` TCP listener — reserved for the (not-built) arbitrary-origin container redirection in
+[container-mitm-arbitrary-origins.md](container-mitm-arbitrary-origins.md).
 
 When containerd pulls through this mirror it encodes the original registry as `?ns=gcr.io`, which
 the client nginx routes on. One `hosts.toml` is generated per Tier-1 upstream plus a `_default`

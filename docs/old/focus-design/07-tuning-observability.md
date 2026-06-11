@@ -208,8 +208,10 @@ silent no-op, because each needs a real dedicated fast vdev that the lab doesn't
 
 The §18.6 pool sizes (`constants.nix:zfsSizesGiB`) are deliberately *tiny* — they exist to make the
 ephemeral lab VMs cheap. This section sizes the pools for the **production PoC**, grounded in a real
-fleet snapshot (`runpod/fleet-snapshots/.../analysis/images.md`, snapshot `2026-06-06`, 3769 hosts
-across 37 DCs). Treat these as starting points: the whole reason the stores are separate pools
+fleet snapshot used here as the **worked example dataset** — one operator's published snapshot
+(RunPod's: `runpod/fleet-snapshots/.../analysis/images.md`, snapshot `2026-06-06`, 3769 hosts
+across 37 DCs). The method is what matters; any operator runs the same audit against their own
+fleet. Treat these as starting points: the whole reason the stores are separate pools
 (§18.6) is that you grow each on its own observed curve.
 
 **The one insight that makes sizing tractable.** The audit reports **2.13 PB** of fleet image

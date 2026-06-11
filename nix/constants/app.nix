@@ -16,6 +16,17 @@ self: {
     nginxStatus   = 8099;   # localhost-only stub_status, scraped by nginxExporter (§19)
   };
 
+  # ─── Unix domain sockets ───────────────────────────────────────────
+  # containerd→client-nginx OCI hop. The patched containerd (dial_addr in
+  # certs.d/*/hosts.toml) dials this socket instead of clientOci TCP; nginx
+  # listens on both (TCP retained for the not-built arbitrary-origin redirect).
+  # Lives under nginx's RuntimeDirectory (/run/nginx, owned nginx:nginx 0750)
+  # because the nginx master runs as the unprivileged `nginx` user and cannot
+  # bind a socket directly in root-owned /run; containerd (root) still connects.
+  socks = {
+    clientOci = "/run/nginx/cache-oci.sock";
+  };
+
   # User-Agent the client nginx sends on every upstream request (§11.1).
   # Single point of change; cache VMs pass it through so origins see it too.
   userAgent = "Custom Nginx Proxy/caching";

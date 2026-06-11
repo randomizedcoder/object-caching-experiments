@@ -12,6 +12,11 @@ independently pulls the same artifacts off the public internet:
 Naively, that is 500× the WAN egress, 500× the latency, and 500× the chance a slow or
 rate-limited origin (Docker Hub especially) stalls a cold start.
 
+This design is **workload-agnostic**: any operator of a datacenter full of container hosts can
+adopt it. Throughout these docs RunPod's images serve as one concrete **example** fleet — a
+representative large AI/ML container workload — but they are illustrative, not the target. An
+operator substitutes their own images and origins and the same two-tier caching applies.
+
 ## 1.2 The goal: caching with the right locality
 
 The design pushes every fetch to the cheapest tier that can satisfy it:

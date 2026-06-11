@@ -21,11 +21,14 @@ let
   mirror   = ''http://127.0.0.1:${toString c.ports.clientOci}'';
 
   # certs.d/<registry>/hosts.toml for every Tier-1 upstream (§12.1) …
+  # dial_addr swaps only the transport: the request still targets `mirror`
+  # (Host: 127.0.0.1:8088), but the patched containerd dials the Unix socket.
   hostsToml = url: ''
     server = "${url}"
 
     [host."${mirror}"]
       capabilities = ["pull", "resolve"]
+      dial_addr = "unix://${c.socks.clientOci}"
   '';
   tierOne = lib.mapAttrs' (ns: u:
     lib.nameValuePair "containerd/certs.d/${ns}/hosts.toml" { text = hostsToml u.url; })
@@ -55,6 +58,7 @@ in
 
       [host."${mirror}"]
         capabilities = ["pull", "resolve"]
+        dial_addr = "unix://${c.socks.clientOci}"
     '';
   };
 }

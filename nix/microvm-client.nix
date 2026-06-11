@@ -8,15 +8,28 @@
 let
   constants = import ./constants.nix;
 
-  # Per-FQDN leaf certs this client's nginx :443 loads (§14.2/§14.3). One
-  # per mitmCertGroups entry, signed by this client's own MITM CA. Empty
-  # until cache-gen-ca has run (mitm == null).
-  mitmLeaves = if mitm == null then [] else
-    map (g: {
-      name = g.name;
-      crt  = mitm.mitmDir + "/${g.name}.crt";
-      key  = mitm.mitmDir + "/${g.name}.key";
-    }) constants.mitmCertGroups;
+  # Patched containerd: adds the `dial_addr` hosts.toml field so the OCI pull
+  # hop reaches the client nginx over a Unix domain socket instead of loopback
+  # TCP (fork randomizedcoder/containerd#1). Pinned by commit rev; vendorHash
+  # stays null (the fork's committed vendor/ is unchanged). The REVISION/VERSION
+  # swap makes `containerd --version` report the fork — positive deploy proof.
+  containerdOverlay = final: prev: {
+    containerd = prev.containerd.overrideAttrs (old: {
+      version = "2.2.1-uds";
+      src = prev.fetchFromGitHub {
+        owner = "randomizedcoder";
+        repo  = "containerd";
+        rev   = "8123c921742aceca6749392d048bf13e0a936d55";
+        hash  = "sha256-AQW1KIFLc2TB2vEkHKHkHuCZNsGmY1SZSPI049Kmyds=";
+      };
+      makeFlags =
+        (builtins.filter
+          (f: !(lib.hasPrefix "REVISION=" f || lib.hasPrefix "VERSION=" f))
+          old.makeFlags)
+        ++ [ "REVISION=8123c921742aceca6749392d048bf13e0a936d55" "VERSION=v2.2.1-uds" ];
+    });
+  };
+
 in
 import ./lib/mk-microvm-node.nix {
   inherit lib microvm nixpkgs system nodeName hostKey sshPubKey;
@@ -30,6 +43,9 @@ import ./lib/mk-microvm-node.nix {
   ];
 
   extraConfig = {
+    # ── patched containerd (UDS dial_addr, §12) ───────────────────────
+    nixpkgs.overlays = [ containerdOverlay ];
+
     # ── cache CA public cert (no-op while cacheCa == null) ─────────────
     system.activationScripts.cache-ca = lib.optionalString (cacheCa != null) ''
       install -d -m 0755 /etc/nginx
@@ -57,15 +73,20 @@ import ./lib/mk-microvm-node.nix {
       '';
     };
 
-    # Install the per-FQDN leaf crt/key nginx loads per SNI server{}.
-    # Owned by nginx (the config-test pre-start reads keys as that user),
-    # mirroring the cache-tls install on the cache VMs.
+    # Install the runtime SNI minter's signing material (§14.6): the per-client
+    # MITM CA cert+key (issuer) and the single reused EC leaf key, all read
+    # once at init_by_lua. Owned by nginx (the config-test pre-start and the
+    # workers read them as that user); private keys 0600. The CA private key
+    # now lives on the box so the minter can sign a leaf per SNI online — it is
+    # per-client and never leaves this node (same isolation as the offline
+    # signer it replaces). Paths match constants.mitmMinter (ca.crt/ca.key/
+    # leaf.key under /etc/nginx/mitm).
     system.activationScripts.mitm-leaves =
-      lib.optionalString (mitm != null) (''
+      lib.optionalString (mitm != null) ''
         install -d -m 0755 /etc/nginx/mitm
-      '' + lib.concatMapStringsSep "\n" (l: ''
-        install -o nginx -g nginx -m 0644 ${l.crt} /etc/nginx/mitm/${l.name}.crt
-        install -o nginx -g nginx -m 0600 ${l.key} /etc/nginx/mitm/${l.name}.key
-      '') mitmLeaves);
+        install -o nginx -g nginx -m 0644 ${mitm.ca}      /etc/nginx/mitm/ca.crt
+        install -o nginx -g nginx -m 0600 ${mitm.caKey}   /etc/nginx/mitm/ca.key
+        install -o nginx -g nginx -m 0600 ${mitm.leafKey} /etc/nginx/mitm/leaf.key
+      '';
   };
 }

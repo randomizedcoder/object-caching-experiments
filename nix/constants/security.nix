@@ -38,4 +38,40 @@ self: {
 
   # Flat list of every MITM'd FQDN → 127.0.0.1 /etc/hosts redirect.
   mitmAllFqdns = builtins.concatLists (map (g: g.fqdns) self.mitmCertGroups);
+
+  # ─── Runtime SNI cert minter (focus-design §14.6) ──────────────────
+  # Tunables for the on-the-fly leaf minter (modules/mitm-minter.lua, wired
+  # in modules/nginx-client.nix). Replaces the pre-minted per-group leaves:
+  # nginx mints+signs a leaf per SNI under this client's MITM CA, caches it
+  # two-tier (per-worker lrucache of parsed cdata + a shared_dict of PEM), and
+  # guards the cold-host stampede with a per-host lock. See §14.6 for the
+  # mitmproxy-derived correctness rules baked into the Lua.
+  mitmMinter = {
+    # Fixed on-box paths the activation installs the signing material to
+    # (nginx-owned; CA key + reused leaf key, §14.2). The minter reads these
+    # once at init_by_lua and reuses them for every signature.
+    caCert  = "/etc/nginx/mitm/ca.crt";
+    caKey   = "/etc/nginx/mitm/ca.key";
+    leafKey = "/etc/nginx/mitm/leaf.key";
+
+    # Shared dicts. certCacheSize is the leaf-PEM cache cap (LRU-evicts under
+    # an SNI flood → set staleness degrades hit-rate, never correctness);
+    # lruSize is the per-worker parsed-cdata cap (what the handshake consumes,
+    # no re-parse); locks/stats are small bookkeeping dicts.
+    certCacheSize = "16m";    # lua_shared_dict mitm_certs  (PEM bytes by host)
+    lockSize      = "1m";     # lua_shared_dict mitm_locks  (lua-resty-lock)
+    statsSize     = "64k";    # lua_shared_dict mitm_stats  (mint/error counters)
+    lruSize       = 512;      # per-worker parsed-cdata entries
+
+    # Leaf shape. Short TTL (we re-mint freely); notBefore back-dated to
+    # tolerate client clock skew (mitmproxy CERT_VALIDITY_OFFSET).
+    leafTtlSeconds  = 7 * 24 * 3600;   # 7d
+    backdateSeconds = 2 * 24 * 3600;   # 2d
+
+    # Collapse a sub-domain SNI onto a single-level wildcard leaf
+    # (cdn-lfs.huggingface.co → *.huggingface.co) so an SNI flood across
+    # sibling sub-domains still mints once. Apex names and IP literals are
+    # never collapsed.
+    wildcardCollapse = true;
+  };
 }

@@ -146,6 +146,7 @@ Apps are Linux-only (gated on `pkgs.stdenv.isLinux`).
 | `cache-vm-wipe`          |     no     | stop a VM and delete its data disks (cold next boot): `-- --node=<name>` |
 | `cache-set-hc`           |     no     | toggle client active health-checking: `-- --state=on\|off`      |
 | `cache-diff-test`        |     no     | three-way probe (upstream vs nginx cache vs Zot oracle) asserting digests match |
+| `cache-mitm-test`        |     no     | drives `client0:443`, validating the runtime SNI cert minter (strict chain accept, shared key / distinct serials, cache-hit reuse, wildcard collapse) |
 | `cache-load-loop`        |     no     | soak/hit-rate loop (pull → run → teardown → re-pull); tallies per-store `cs=HIT/MISS` from the §19 split access logs |
 
 `<name>` is one of `client0`, `cache0`, `cache1`.

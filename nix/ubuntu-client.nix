@@ -29,16 +29,6 @@ let
     inherit lib; values = import ./sysctl-values.nix;
   };
 
-  # Per-FQDN leaf crt/key this client's nginx :443 loads (§14.2). One per
-  # mitmCertGroups entry, from client0's reused MITM tree. Empty until
-  # cache-gen-ca has run (mitm == null).
-  mitmLeaves = if mitm == null then [] else
-    map (g: {
-      name = g.name;
-      crt  = mitm.mitmDir + "/${g.name}.crt";
-      key  = mitm.mitmDir + "/${g.name}.key";
-    }) c.mitmCertGroups;
-
   # nginx runs as the userborn-created static nginx user (uid/gid 980, forced
   # by system-manager's nginx.nix); reference it numerically so the etc-file
   # copy doesn't depend on name resolution ordering during activation.
@@ -237,13 +227,17 @@ in
     })
     (lib.optionalAttrs (mitm != null) {
       "cache-mitm-ca.crt".source = mitm.ca;
+      # Runtime SNI minter signing material (§14.6): CA cert+key (issuer) +
+      # the single reused EC leaf key, read once at init_by_lua. Private keys
+      # are nginx-owned 0440. Paths match constants.mitmMinter.
+      "nginx/mitm/ca.crt".source = mitm.ca;
+      "nginx/mitm/ca.key" = {
+        source = mitm.caKey; mode = "0440"; uid = nginxUid; gid = nginxUid;
+      };
+      "nginx/mitm/leaf.key" = {
+        source = mitm.leafKey; mode = "0440"; uid = nginxUid; gid = nginxUid;
+      };
     })
-    (lib.optionalAttrs (mitm != null) (lib.listToAttrs (lib.concatMap (l: [
-      (lib.nameValuePair "nginx/mitm/${l.name}.crt" { source = l.crt; })
-      (lib.nameValuePair "nginx/mitm/${l.name}.key" {
-        source = l.key; mode = "0440"; uid = nginxUid; gid = nginxUid;
-      })
-    ]) mitmLeaves)))
   ];
 
   # ── runtime trust (CA store + bundle + /etc/hosts) ────────────────────

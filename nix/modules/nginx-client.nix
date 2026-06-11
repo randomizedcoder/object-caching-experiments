@@ -20,6 +20,14 @@
 let
   c  = import ../constants.nix;
   hc = c.healthcheck;
+  m  = c.mitmMinter;
+
+  # The runtime SNI minter (§14.6): lua-resty-openssl provides the X.509
+  # builder; mitm-minter.lua is shipped as a one-file lualib dir on the Lua
+  # package path. Both are added to lua_package_path below.
+  restyOpenssl = pkgs.luajitPackages.lua-resty-openssl;
+  minterLib    = pkgs.writeTextDir "mitm-minter.lua"
+    (builtins.readFile ./mitm-minter.lua);
 
   # Cache VM peers for each upstream, driven from constants (no hardcoding).
   ociServers = lib.concatStringsSep "\n      " (map (n:
@@ -54,33 +62,54 @@ let
     if builtins.hasAttr g.name c.modelStores
     then "shared_model_${g.name}" else "shared_model_extra";
 
-  # One :443 server{} per mitmCertGroups entry. SNI selects the per-FQDN
-  # leaf cert (this client's own, §14.2); the decrypted request is sent on
-  # to the cache layer with the original FQDN in X-Orig-Host. H2 today;
-  # HTTP/3 is a tuning follow-up (§18.3).
-  mitmServers = lib.concatStringsSep "\n" (map (g: ''
+  # One :443 server{} per mitmCertGroups entry, mapping a model store's FQDNs
+  # to its dedicated cache vhost/port. The leaf cert is no longer pre-minted:
+  # ssl_certificate_by_lua mints it per SNI under this client's MITM CA
+  # (§14.6). The static ssl_certificate is only the placeholder nginx requires
+  # — the Lua hook clears+replaces it every handshake; if the hook errors the
+  # placeholder (the CA cert, which no client accepts for an origin SNI) is
+  # served, so a mint failure fails that one handshake, never serves wrong
+  # bytes. H2 today; HTTP/3 is a tuning follow-up (§18.3).
+  mitmServer = { listenExtra ? "", serverName, cacheKey, upstream }: ''
     server {
-      listen 443 ssl;
+      listen 443 ssl${listenExtra};
       http2 on;
-      server_name ${lib.concatStringsSep " " g.fqdns};
-      ssl_certificate     /etc/nginx/mitm/${g.name}.crt;
-      ssl_certificate_key /etc/nginx/mitm/${g.name}.key;
+      server_name ${serverName};
+      ssl_certificate     ${m.caCert};
+      ssl_certificate_key ${m.caKey};
+      ssl_certificate_by_lua_block { require("mitm-minter").handle() }
 
       proxy_cache model_hot;               # model-store hot tier (cache-http pool)
       location = /health { return 200 "ok\n"; }
       location / {
-        set $cache_key "${g.name}:$host$uri";   # ketama peer selection
-        proxy_cache_key "${g.name}:$host$uri";  # local hot-tier dedup
-        proxy_set_header X-Orig-Host $host;      # original origin for the cache
+        set $cache_key "${cacheKey}";            # ketama peer selection
+        proxy_cache_key "${cacheKey}";           # local hot-tier dedup
+        proxy_set_header X-Orig-Host $host;       # original origin for the cache
         proxy_set_header Host $host;
         proxy_cache_valid 200 206 60d;
         proxy_cache_lock on;
-        proxy_pass https://${groupUpstream g};
+        proxy_pass https://${upstream};
         add_header X-Cache-Hot  $upstream_cache_status;
         add_header X-Cache-Time $request_time;
         access_log /var/log/nginx/model.log cache;
       }
-    }'') c.mitmCertGroups);
+    }'';
+
+  mitmServers = lib.concatStringsSep "\n" (map (g: mitmServer {
+    serverName = lib.concatStringsSep " " g.fqdns;
+    cacheKey   = "${g.name}:$host$uri";
+    upstream   = groupUpstream g;
+  }) c.mitmCertGroups);
+
+  # Catch-all :443 (§14.6): any SNI not matched by a model-store server{}
+  # above is minted on the fly and routed to the generic extra upstream. This
+  # is the seam the not-built arbitrary-origin DNAT redirect would feed.
+  catchAllServer = mitmServer {
+    listenExtra = " default_server";
+    serverName  = "_";
+    cacheKey    = "extra:$host$uri";
+    upstream    = "shared_model_extra";
+  };
 in
 {
   services.nginx = {
@@ -147,8 +176,37 @@ in
       # ── model-store + extra upstreams (cache VM model vhosts, §15) ─────
       ${modelUpstreams}
 
+      # ── Lua: resty-openssl (cert builder) + the minter lib + bundled ──
+      # OpenResty libs (healthcheck) via the trailing ;; default path.
+      lua_package_path "${minterLib}/?.lua;${restyOpenssl}/share/lua/5.1/?.lua;;";
+
+      # ── runtime SNI cert minter shared state (§14.6) ──────────────────
+      # mitm_certs: leaf PEM by host (LRU cap = certCacheSize). mitm_locks:
+      # lua-resty-lock cold-mint guard. mitm_stats: mint/error/evict counters.
+      lua_shared_dict mitm_certs ${m.certCacheSize};
+      lua_shared_dict mitm_locks ${m.lockSize};
+      lua_shared_dict mitm_stats ${m.statsSize};
+      init_by_lua_block {
+        -- Load the CA cert+key and the reused leaf key ONCE; reused for every
+        -- per-SNI signature. Fails gracefully (handle() no-ops) if the MITM
+        -- material isn't on the box yet — the :443 servers then only serve
+        -- the placeholder cert, same as before this client is provisioned.
+        local ok, err = require("mitm-minter").init({
+          ca_cert    = "${m.caCert}",
+          ca_key     = "${m.caKey}",
+          leaf_key   = "${m.leafKey}",
+          cert_dict  = "mitm_certs",
+          lock_dict  = "mitm_locks",
+          stats_dict = "mitm_stats",
+          lru_size   = ${toString m.lruSize},
+          leaf_ttl_seconds  = ${toString m.leafTtlSeconds},
+          backdate_seconds  = ${toString m.backdateSeconds},
+          wildcard_collapse = ${if m.wildcardCollapse then "true" else "false"},
+        })
+        if not ok then ngx.log(ngx.ERR, "mitm-minter init: ", err) end
+      }
+
       # ── in-process active health-check (§11.3) ────────────────────────
-      lua_package_path ";;";
       lua_shared_dict healthcheck 1m;
       init_worker_by_lua_block {
         -- Runtime kill-switch (§11.3): `cache-set-hc --state=off` touches this
@@ -179,15 +237,21 @@ in
         }
       }
 
-      # ── :443 MITM frontends (one server{} per cert group, §14.3) ──────
+      # ── :443 MITM frontends: per-store routers + a minting catch-all ──
       ${mitmServers}
+      ${catchAllServer}
     '';
 
     virtualHosts = {
-      # ── OCI frontend (:8088) — containerd hosts.toml target ───────────
+      # ── OCI frontend (:8088 + UDS) — containerd hosts.toml target ─────
+      # containerd dials the Unix socket (patched dial_addr); the TCP
+      # listener is retained for the not-built arbitrary-origin redirect.
       "client-oci" = {
         default = true;
-        listen  = [{ addr = "0.0.0.0"; port = c.ports.clientOci; }];
+        listen  = [
+          { addr = "0.0.0.0"; port = c.ports.clientOci; }
+          { addr = "unix:${c.socks.clientOci}"; }
+        ];
         extraConfig = ''
           # Per-tier cache + latency headers, inherited by both locations.
           add_header X-Cache-Hot  $upstream_cache_status;   # local hot-tier HIT/MISS
