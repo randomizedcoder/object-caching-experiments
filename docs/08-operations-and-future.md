@@ -16,8 +16,8 @@ nix run .#cache-diff-test       # 5. prove nginx cache == upstream (byte-identic
 
 Other apps cover the Ubuntu clients (`cache-ubuntu-up` / `-deploy` / `-ssh` / `-down`), trust
 distribution (`cache-distribute-trust`), the health-check kill-switch (`cache-set-hc`), a load
-loop (`cache-load-loop`), and VM lifecycle (`cache-vm-ssh` / `-stop` / `-wipe`). See
-`nix/README.md` for the full table.
+loop (`cache-load-loop`), the MITM cert-minter gate (`cache-mitm-test`), and VM lifecycle
+(`cache-vm-ssh` / `-stop` / `-wipe`). See `nix/README.md` for the full table.
 
 ## 8.2 The correctness gate
 
@@ -63,7 +63,8 @@ the working lab and the roadmap is unambiguous. Do not read these as present-ten
     wrong or thrashing — and the Zot oracle's byte-identical check must extend to ranged reads.
   - **Index availability is the binding constraint for *our* workload.** Lazy loading only helps
     images that *have* a SOCI index. The third-party RunPod / Docker Hub images we pull almost
-    certainly ship none → eager fallback → zero benefit. Closing that gap means either upstream runs
+    certainly ship none → eager
+    fallback → zero benefit. Closing that gap means either upstream runs
     `soci create`/push (out of our control) or **the cache synthesizes indices on ingest** — itself
     a substantial feature.
   - **Registry-path requirements.** The path must support the Referrers API (or the tag-scheme
@@ -86,3 +87,36 @@ the working lab and the roadmap is unambiguous. Do not read these as present-ten
   build-time assertion: in the lab every virtio disk shares one host backing store, so an L2ARC
   vdev can't be faster and a SLOG would sit idle (all datasets are `sync=disabled`). Enable either
   only with a real dedicated fast device on production hardware. **Not enabled.**
+
+## 8.5 Next phases — the arbitrary-origin roadmap
+
+The runtime per-SNI cert minter ([§05.3](05-trust-and-mitm.md)) is now shipped, which removes the
+cert half of the "MITM only a curated FQDN list" ceiling. The remaining phases generalise
+interception to origins we can't enumerate up front; the full design and trade-offs live in
+[`container-mitm-arbitrary-origins.md`](container-mitm-arbitrary-origins.md). In rough dependency
+order:
+
+1. **`ssl_preread` stream-passthrough** — a `stream{}` front that peeks the ClientHello SNI and
+   passes flows we don't cache (or that pin certs) straight through, MITM'ing only the rest. The
+   minter's no-SNI branch is already the seam this attaches to. It is both the second filter stage
+   and the mandatory escape hatch, so it lands **before** packet-layer redirection.
+2. **nftables DNAT at the docker bridge** — replace the `/etc/hosts` redirection (the last
+   hostname-keyed half) with a `dstnat` rule in [`network-setup.nix`](../nix/network-setup.nix),
+   gated on a named `@cdn_origins` interval set so only cached origin/CDN ranges are intercepted and
+   all other egress passes untouched.
+3. **IP-range updater daemon** — populate `@cdn_origins` from published feeds (AWS `ip-ranges.json`,
+   GitHub `meta`, Cloudflare, Fastly, GCP). This is a failure-mode-heavy design of its own
+   (rate-cap the churn, persist last-known-good, validate-before-apply atomically) — treat it as a
+   separate workstream, not a script.
+4. **Delegated auth for private registries** — an `access_by_lua` gate on the serving path that
+   replays the client's own credential against the origin (`HEAD`/token handshake) before serving
+   cached private content, with a short-TTL `(client-identity, repo)` authz cache and an optional
+   `lua-resty-jwt` fast path. Required the moment interception includes a registry that answers
+   `401` (e.g. `registry.runpod.net`).
+5. **Accelerator config-redirect** — for surfaces with a protocol-native mirror (PyPI via
+   `PIP_INDEX_URL`/`pip.conf`, dnf), inject the redirect through the existing runc shim instead of
+   MITM'ing. Cheaper and preferred wherever a mirror + config knob exists; MITM stays the exception
+   for GitHub release-asset wheels and git clones.
+
+Phases 1–2 are the critical path to "arbitrary origins"; 3 hardens 2; 4 and 5 are independent and
+can land in any order once 1–2 exist.

@@ -104,11 +104,18 @@ NODES
                     # PUBLIC cache-CA.crt (bare-metal box, §16 bootstrap).
       NODE=""       # --node=NAME: mint MITM only for NAME (default: all
                     # constants.clientNames). Bare-metal boxes pass client0.
+      LEGACY_LEAVES=0 # --legacy-leaves: also mint the OLD pre-minted per-group
+                      # leaves (secrets/<client>/mitm/<group>.{crt,key}). The
+                      # runtime SNI minter (§14.6) supersedes them — it signs a
+                      # leaf per SNI on the box from the CA key + reused leaf
+                      # key below — so they are off by default. Kept for the
+                      # pre-minter fallback path only.
       for arg in "$@"; do
         case "$arg" in
           --force) FORCE=1 ;;
           --mitm-only) MITM_ONLY=1 ;;
           --node=*) NODE="''${arg#--node=}" ;;
+          --legacy-leaves) LEGACY_LEAVES=1 ;;
           *) echo "unknown arg: $arg" >&2; exit 2 ;;
         esac
       done
@@ -164,10 +171,19 @@ EXT
         echo "Cache CA + shared server cert written to $DIR (SAN ${cacheSan})"
       fi
 
-      # ── per-client MITM CA + per-FQDN leaves (§14.2) ──────────────────
-      # Each client mints+trusts its OWN root CA (full isolation), then one
-      # leaf per mitmCertGroups entry signed by that CA. SAN = the group's
-      # fqdns. Distinct trust tree from the cache CA above.
+      # ── per-client MITM CA + runtime SNI minter material (§14.2/§14.6) ─
+      # Each client mints+trusts its OWN root CA (full isolation). The CA is
+      # ECDSA P-256 (EC signing is the per-handshake cost of the runtime
+      # minter — RSA is the wrong default here) and carries a
+      # subjectKeyIdentifier, which the minter copies BYTE-FOR-BYTE into each
+      # leaf's authorityKeyIdentifier (the AKI footgun strict clients reject).
+      # Alongside the CA we mint ONE reused EC leaf key per client: the minter
+      # signs every per-SNI leaf with this single key (mitmproxy lesson — one
+      # signature per host, never a keygen). Both the CA KEY and the leaf key
+      # now live on the client box for runtime signing (per-client, never
+      # leaves it — same isolation as before, online signer instead of
+      # offline). Legacy pre-minted per-group leaves are off unless
+      # --legacy-leaves (the minter replaces them).
       # --node=NAME narrows the loop to a single client (bare-metal box);
       # default is every constants.clientNames entry.
       if [ -n "$NODE" ]; then
@@ -187,14 +203,29 @@ EXT
 
         CA_KEY="$CLDIR/ca/$client-CA.key"
         CA_CRT="$CLDIR/ca/$client-CA.crt"
-        openssl genrsa -out "$CA_KEY" 4096
+        # EC P-256 CA. subjectKeyIdentifier=hash is load-bearing: the runtime
+        # minter reads this SKI and copies it verbatim into every leaf's AKI.
+        openssl ecparam -name prime256v1 -genkey -noout -out "$CA_KEY"
         chmod 600 "$CA_KEY"
         openssl req -x509 -new -nodes -key "$CA_KEY" \
           -sha256 -days 3650 -out "$CA_CRT" \
-          -subj "/O=object-caching-experiments/CN=$client-MITM-CA"
+          -subj "/O=object-caching-experiments/CN=$client-MITM-CA" \
+          -addext "basicConstraints=critical,CA:TRUE" \
+          -addext "keyUsage=critical,keyCertSign,cRLSign" \
+          -addext "subjectKeyIdentifier=hash"
         chmod 644 "$CA_CRT"
 
-        while read -r group fqdns; do
+        # One reused EC leaf key per client — every per-SNI leaf the minter
+        # forges is signed under this single key (loaded once at init_by_lua).
+        LEAF_KEY="$CLDIR/mitm/leaf.key"
+        openssl ecparam -name prime256v1 -genkey -noout -out "$LEAF_KEY"
+        chmod 600 "$LEAF_KEY"
+
+        if [ "$LEGACY_LEAVES" -ne 1 ]; then
+          echo "  MITM CA + reused leaf key for $client (runtime SNI minter; pre-minted leaves skipped)"
+        fi
+
+        while [ "$LEGACY_LEAVES" -eq 1 ]; do read -r group fqdns || break
           [ -z "$group" ] && continue
           # a,b,c → DNS:a,DNS:b,DNS:c
           san="$(printf '%s' "$fqdns" | sed 's/[^,][^,]*/DNS:&/g')"

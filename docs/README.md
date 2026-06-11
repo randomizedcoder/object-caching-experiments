@@ -27,7 +27,7 @@ tested on a single host.
 | [02 — Architecture & topology](02-architecture.md) | The fleet, the `cachebr0` network, the IP/MAC/port map, and the repo/module layout. |
 | [03 — The client cache](03-client.md) | The per-client nginx: local hot tiers, consistent-hash routing, digest-keyed blobs, health-checking, and container-runtime wiring. |
 | [04 — The shared cache VMs](04-cache-vms.md) | The shared nginx pull-through cache, the ZFS pool split, and the Zot verification oracle. |
-| [05 — Trust & MITM](05-trust-and-mitm.md) | The two CAs, per-FQDN leaf certs, host redirection, and the runc CA-injector that makes *unmodified* pulls work. |
+| [05 — Trust & MITM](05-trust-and-mitm.md) | The two CAs, the runtime per-SNI leaf minter, host redirection, and the runc CA-injector that makes *unmodified* pulls work. |
 | [06 — Content sources](06-content-sources.md) | What is cached and how each is keyed: OCI registries, apt mirrors, and the four model stores. |
 | [07 — Tuning & observability](07-tuning-observability.md) | Kernel/nginx tuning, the unified access-log format, and the Prometheus exporters. |
 | [08 — Operations & future work](08-operations-and-future.md) | Build/run/deploy workflow, the differential-test correctness gate, and a fenced list of work not yet built. |

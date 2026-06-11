@@ -321,6 +321,197 @@ in
     '';
   };
 
+  # ── Phase 3: runtime SNI cert-minter correctness gate (§14.6) ─────────
+  # Drives the client's :443 MITM frontend directly from the host (the
+  # listener binds 0.0.0.0, so we connect to the client IP with an SNI and
+  # the ssl_certificate_by_lua minter forges a leaf for that name). For each
+  # probe we pull the served leaf with `openssl s_client -servername` and
+  # assert the mitmproxy-derived correctness rules baked into the minter:
+  #   1. chain validates leaf→client-MITM-CA under `openssl verify -x509_strict`
+  #   2. Go crypto/x509 (strict: SAN-only, EKU serverAuth) accepts it
+  #   3. distinct SNIs get distinct serials but SHARE the one reused leaf key
+  #   4. a repeat SNI returns the SAME serial (two-tier cache HIT, not a re-mint)
+  #   5. sibling sub-domains collapse onto ONE *.parent wildcard leaf (same serial)
+  # Covers all three :443 server{} shapes: a model-store router (huggingface),
+  # a mitmExtraHost (download.docker.com), and the minting catch-all (an
+  # arbitrary origin the fleet never pre-declared).
+  mitmTest = pkgs.writeShellApplication {
+    name = "cache-mitm-test";
+    runtimeInputs = with pkgs; [ openssl go coreutils gnugrep gnused gawk ];
+    text = let
+      clientName = builtins.head constants.clientNames;
+      clientIp   = constants.network.ipv4.${clientName};
+      port       = toString constants.ports.clientMitm;
+      caRel      = "secrets/${clientName}/ca/${clientName}-CA.crt";
+      # Strict acceptance check beyond `openssl verify`: Go's crypto/x509
+      # enforces SAN-only identity (no CN fallback since 1.15) and the EKU,
+      # which is exactly the strict-client class the minter targets. Stdlib
+      # only → `go run` works offline with a scratch GOCACHE.
+      goVerifier = pkgs.writeText "mitm-verify.go" ''
+        package main
+
+        import (
+        	"crypto/x509"
+        	"encoding/pem"
+        	"fmt"
+        	"os"
+        )
+
+        func fail(err error) {
+        	fmt.Fprintln(os.Stderr, "go-verify:", err)
+        	os.Exit(1)
+        }
+
+        func main() {
+        	// args: caPath leafPath dnsName
+        	caPEM, err := os.ReadFile(os.Args[1])
+        	if err != nil {
+        		fail(err)
+        	}
+        	leafPEM, err := os.ReadFile(os.Args[2])
+        	if err != nil {
+        		fail(err)
+        	}
+        	roots := x509.NewCertPool()
+        	if !roots.AppendCertsFromPEM(caPEM) {
+        		fail(fmt.Errorf("no CA in %s", os.Args[1]))
+        	}
+        	block, _ := pem.Decode(leafPEM)
+        	if block == nil {
+        		fail(fmt.Errorf("no PEM cert in %s", os.Args[2]))
+        	}
+        	leaf, err := x509.ParseCertificate(block.Bytes)
+        	if err != nil {
+        		fail(err)
+        	}
+        	if _, err := leaf.Verify(x509.VerifyOptions{
+        		Roots:     roots,
+        		DNSName:   os.Args[3],
+        		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+        	}); err != nil {
+        		fail(err)
+        	}
+        	fmt.Println("OK")
+        }
+      '';
+    in ''
+      set -uo pipefail
+
+      IP="${clientIp}"
+      PORT="${port}"
+      CA="''${PWD}/${caRel}"
+      if [[ ! -f "$CA" ]]; then
+        echo "ERROR: $CA not found. Run 'nix run .#cache-gen-ca' (EC scheme) first." >&2
+        exit 1
+      fi
+
+      WORK="$(mktemp -d)"
+      trap 'rm -rf "$WORK"' EXIT
+      # go run needs a writable cache + HOME; keep it fully offline/local.
+      export HOME="$WORK" GOCACHE="$WORK/gocache" GO111MODULE=off GOTOOLCHAIN=local GOFLAGS=
+
+      pass=0; fail=0
+      note_pass() { echo "   PASS: $1"; pass=$((pass+1)); }
+      note_fail() { echo "   FAIL: $1"; fail=$((fail+1)); }
+
+      # Pull the served leaf for one SNI into $2 (PEM). The minter forges it in
+      # the handshake; `openssl x509` reads the first (leaf) cert of the chain.
+      fetch_leaf() {
+        local sni="$1" out="$2"
+        openssl s_client -connect "$IP:$PORT" -servername "$sni" -showcerts \
+          </dev/null 2>/dev/null | openssl x509 -outform PEM >"$out" 2>/dev/null
+        [[ -s "$out" ]]
+      }
+
+      x509_field() { openssl x509 -in "$1" -noout "$2" 2>/dev/null; }
+
+      # Liveness: the frontend must answer a TLS handshake at all.
+      if ! fetch_leaf "huggingface.co" "$WORK/probe.pem"; then
+        echo "ERROR: no leaf served by $IP:$PORT — is ${clientName} booted and provisioned?" >&2
+        echo "       (nix run .#cache-start-all, and regenerate EC secrets if needed)" >&2
+        exit 1
+      fi
+
+      # Each SNI exercises a different :443 server{} shape.
+      #   huggingface.co       → model-store router  (apex, never collapsed)
+      #   download.docker.com  → mitmExtraHost block
+      #   registry.example.org → minting catch-all   (arbitrary origin)
+      for sni in huggingface.co download.docker.com registry.example.org; do
+        echo "── $sni ──"
+        leaf="$WORK/$sni.pem"
+        if ! fetch_leaf "$sni" "$leaf"; then
+          note_fail "$sni: no leaf served"; continue
+        fi
+        if openssl verify -x509_strict -CAfile "$CA" "$leaf" >/dev/null 2>&1; then
+          note_pass "$sni: openssl -x509_strict chain OK"
+        else
+          note_fail "$sni: openssl -x509_strict rejected"
+          openssl verify -x509_strict -CAfile "$CA" "$leaf" 2>&1 | sed 's/^/        /'
+        fi
+        if [[ "$(go run ${goVerifier} "$CA" "$leaf" "$sni" 2>"$WORK/go.err")" == "OK" ]]; then
+          note_pass "$sni: Go crypto/x509 strict accepts"
+        else
+          note_fail "$sni: Go crypto/x509 strict rejected"
+          sed 's/^/        /' "$WORK/go.err"
+        fi
+        san="$(x509_field "$leaf" -ext subjectAltName | grep -o 'DNS:[^,]*' | head -1)"
+        echo "   SAN=''${san:-<none>} serial=$(x509_field "$leaf" -serial)"
+      done
+
+      echo "── shared leaf key + distinct serials ──"
+      # The single reused EC leaf key means every forged leaf carries the SAME
+      # public key; only the serial (random per mint) distinguishes them.
+      hf_serial="$(x509_field "$WORK/huggingface.co.pem" -serial)"
+      dk_serial="$(x509_field "$WORK/download.docker.com.pem" -serial)"
+      hf_pub="$(x509_field "$WORK/huggingface.co.pem" -pubkey)"
+      dk_pub="$(x509_field "$WORK/download.docker.com.pem" -pubkey)"
+      if [[ "$hf_serial" != "$dk_serial" ]]; then
+        note_pass "distinct SNIs → distinct serials ($hf_serial vs $dk_serial)"
+      else
+        note_fail "distinct SNIs collided on serial $hf_serial"
+      fi
+      if [[ -n "$hf_pub" && "$hf_pub" == "$dk_pub" ]]; then
+        note_pass "leaves share the one reused leaf key"
+      else
+        note_fail "leaves do NOT share a public key"
+      fi
+
+      echo "── repeat SNI is a cache HIT (no re-mint) ──"
+      # A second handshake for the same name must return the byte-identical
+      # leaf (same serial) — proof the two-tier cache served it, not a re-sign.
+      fetch_leaf "huggingface.co" "$WORK/hf2.pem" || true
+      hf2_serial="$(x509_field "$WORK/hf2.pem" -serial)"
+      if [[ -n "$hf_serial" && "$hf_serial" == "$hf2_serial" ]]; then
+        note_pass "repeat huggingface.co reused cached leaf ($hf_serial)"
+      else
+        note_fail "repeat huggingface.co re-minted ($hf_serial → $hf2_serial)"
+      fi
+
+      echo "── sibling sub-domains collapse to one *.parent leaf ──"
+      # cdn-lfs.* and cdn-lfs-us-1.* both fold onto *.huggingface.co, so they
+      # share a cache key → one mint, one serial, a wildcard SAN.
+      fetch_leaf "cdn-lfs.huggingface.co"      "$WORK/wc1.pem" || true
+      fetch_leaf "cdn-lfs-us-1.huggingface.co" "$WORK/wc2.pem" || true
+      wc1_serial="$(x509_field "$WORK/wc1.pem" -serial)"
+      wc2_serial="$(x509_field "$WORK/wc2.pem" -serial)"
+      wc_san="$(x509_field "$WORK/wc1.pem" -ext subjectAltName | grep -o 'DNS:[^,]*' | head -1)"
+      if [[ "$wc_san" == "DNS:*.huggingface.co" ]]; then
+        note_pass "sub-domain leaf SAN collapsed to $wc_san"
+      else
+        note_fail "sub-domain leaf SAN was ''${wc_san:-<none>}, expected DNS:*.huggingface.co"
+      fi
+      if [[ -n "$wc1_serial" && "$wc1_serial" == "$wc2_serial" ]]; then
+        note_pass "siblings shared one wildcard leaf ($wc1_serial)"
+      else
+        note_fail "siblings minted separately ($wc1_serial vs $wc2_serial)"
+      fi
+
+      echo ""
+      echo "=== mitm-test: $pass passed, $fail failed ==="
+      [[ "$fail" -eq 0 ]]
+    '';
+  };
+
   # ── cache load-loop: soak driver to watch per-store cache hits (§21) ──
   # Drives a client over SSH on a cadence — pull → run → dwell → teardown
   # (rmi, which FORCES the next cycle's re-pull) → pause → repeat — so the

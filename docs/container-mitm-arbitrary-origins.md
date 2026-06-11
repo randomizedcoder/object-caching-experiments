@@ -1,37 +1,44 @@
 # Container MITM for *arbitrary* origins — an exploration
 
-> **STATUS: Exploration / forward-looking proposal — NOT built.**
-> Nothing in this document is implemented. The shipped, tested container-MITM mechanism is
-> [§05 — Trust & MITM](05-trust-and-mitm.md); this doc only sketches how that mechanism *could* be
-> generalised, and weighs the trade-offs. Read every "would / could / one option" below as
-> conditional, not as current behaviour.
+> **STATUS: Mostly forward-looking proposal — one piece now SHIPPED.**
+> Of the three interception pieces this doc proposes (redirection, cert minting, CA delivery), the
+> **cert-minting** half is now built and tested: the runtime per-SNI leaf minter described under
+> *Cert minting: on-the-fly leaves* is live in
+> [`mitm-minter.lua`](../nix/modules/mitm-minter.lua) +
+> [`nginx-client.nix`](../nix/modules/nginx-client.nix) and gated by `nix run .#cache-mitm-test`
+> (see [§05.3](05-trust-and-mitm.md)). The **redirection** half (nftables DNAT + the IP-range
+> updater), the **delegated-auth** gate for private registries, and the layer-injection CA-delivery
+> alternative remain unbuilt sketches. Sections below are flagged **SHIPPED** or **NOT built**
+> individually; read every "would / could / one option" in a NOT-built section as conditional.
 
 ## Why the allowlist is the ceiling
 
 Today the lab can MITM a container's HTTPS only for a **curated list of FQDNs** — the model stores
-plus `mitmExtraHosts` ([§05.2](05-trust-and-mitm.md)). That ceiling is not incidental; it is baked
-into the two mechanisms §05 uses, and **both** are keyed on a hostname you must know in advance:
+plus `mitmExtraHosts` ([§05.2](05-trust-and-mitm.md)). Of the two mechanisms §05 used, one ceiling
+has now been removed and one remains:
 
-- **Redirection is DNS-based.** Each MITM'd host gets a `/etc/hosts` line — `127.0.0.1 <fqdn>` on
-  the client ([`mitm.nix`](../nix/modules/mitm.nix)) and `<client-ip> <fqdn>` inside each container
-  ([`ca-injector.nix`](../nix/modules/ca-injector.nix)). No line, no interception.
-- **Certs are pre-minted per FQDN.** `cache-gen-secrets` writes one leaf per cert group to
-  `secrets/<client>/mitm/<group>.{crt,key}` ([`secrets-gen.nix`](../nix/secrets-gen.nix)), and the
-  client `:443` server blocks pick one by SNI ([`nginx-client.nix`](../nix/modules/nginx-client.nix)).
-  No leaf, no valid forged cert.
+- **Redirection is DNS-based** *(still the ceiling)*. Each MITM'd host gets a `/etc/hosts` line —
+  `127.0.0.1 <fqdn>` on the client ([`mitm.nix`](../nix/modules/mitm.nix)) and `<client-ip> <fqdn>`
+  inside each container ([`ca-injector.nix`](../nix/modules/ca-injector.nix)). No line, no
+  interception. This is now the *only* hostname-keyed half left.
+- **Certs are minted on the fly** *(ceiling removed — SHIPPED)*. Leaves are no longer pre-minted per
+  FQDN; the client `:443` frontend forges a leaf for **whatever SNI arrives** under this client's
+  MITM CA ([`mitm-minter.lua`](../nix/modules/mitm-minter.lua),
+  [`nginx-client.nix`](../nix/modules/nginx-client.nix)), and a catch-all `server{}` already accepts
+  SNIs that were never declared up front. So the cert half is already hostname-agnostic.
 
 So intercepting an origin you *cannot enumerate up front* — the realistic case for arbitrary
 container workloads (a RunPod image may `pip install`, `git clone`, or fetch weights from dozens of
-hosts) — requires making **both** halves hostname-agnostic. That is the thesis of this doc, and the
-lens for every section below.
+hosts) — now turns on making the **redirection** half hostname-agnostic
+too. That is the remaining thesis of this doc, and the lens for the redirection sections below.
 
 ## The three pieces that would have to change
 
-| Concern | §05 today (hostname-keyed) | Arbitrary-origin replacement |
-|---|---|---|
-| **Redirection** | `/etc/hosts` line per FQDN, host + container | **nftables DNAT** at the docker bridge, by port |
-| **Cert minting** | pre-minted per-FQDN leaves, SNI-selected | **on-the-fly leaves** minted per SNI under the same MITM CA |
-| **CA delivery** | runc shim bind-mounts CA bundle + env vars | a container **filesystem layer** *or* keep the shim |
+| Concern | §05 origin (hostname-keyed) | Arbitrary-origin replacement | State |
+|---|---|---|---|
+| **Redirection** | `/etc/hosts` line per FQDN, host + container | **nftables DNAT** at the docker bridge, by port | NOT built |
+| **Cert minting** | pre-minted per-FQDN leaves, SNI-selected | **on-the-fly leaves** minted per SNI under the same MITM CA | **SHIPPED** |
+| **CA delivery** | runc shim bind-mounts CA bundle + env vars | a container **filesystem layer** *or* keep the shim | shim shipped; layer NOT built |
 
 The CA *trust anchor* does not change — it is still the **per-client MITM CA** from
 [§05.1](05-trust-and-mitm.md). Only the delivery, the redirection, and the leaf-minting become
@@ -126,18 +133,23 @@ badly wrong:
 The full failure-mode analysis (refresh cadence, partial-feed handling, v4/v6 parity, observability,
 alerting on churn) is a follow-up design, deliberately out of scope for this document.
 
-## Cert minting: on-the-fly leaves
+## Cert minting: on-the-fly leaves — **SHIPPED**
 
-Pre-minted leaves cannot answer an SNI you have never seen, so an arbitrary-origin design needs to
-**mint a leaf on demand**, signed by the same per-client MITM CA the container already trusts. Two
-routes:
+> **Built.** This section described two routes; the recommended one (mint inside nginx) is now
+> implemented in [`mitm-minter.lua`](../nix/modules/mitm-minter.lua), wired in
+> [`nginx-client.nix`](../nix/modules/nginx-client.nix), tuned via `mitmMinter` in
+> [`nix/constants/security.nix`](../nix/constants/security.nix), and gated by `nix run
+> .#cache-mitm-test`. The "Designing the Lua SNI minter" subsection below is the as-built spec.
 
-- **Mint inside nginx (recommended).** OpenResty is already the `:443` terminator, so an
-  `ssl_certificate_by_lua` handler could read the SNI, generate-or-cache a leaf for that name under
-  the MITM CA, and hand it to the handshake. This keeps one component on the data path and reuses
+Pre-minted leaves cannot answer an SNI you have never seen, so the design **mints a leaf on demand**,
+signed by the same per-client MITM CA the container already trusts. Two routes were on the table:
+
+- **Mint inside nginx (chosen, shipped).** OpenResty is already the `:443` terminator, so an
+  `ssl_certificate_by_lua` handler reads the SNI, generate-or-caches a leaf for that name under
+  the MITM CA, and hands it to the handshake. This keeps one component on the data path and reuses
   the existing trust anchor.
 - **A dedicated transparent MITM proxy** (mitmproxy-style) sitting in front of the cache, doing the
-  same generate-per-SNI dance.
+  same generate-per-SNI dance — rejected to avoid bolting a second, slower process onto the data path.
 
 **On engine choice / performance.** mitmproxy is excellent for *prototyping* the SNI dance, but it
 is **Python** — the per-connection overhead and the GIL make it the wrong **data-path** engine for
@@ -298,9 +310,9 @@ the *snapshotter* — even a Rust shim cannot reliably read the merged rootfs at
 
 Everything above is about *interception* — getting the bytes off the wire. The moment "arbitrary
 origins" includes a **private** registry it surfaces a separate axis the curated allowlist never
-touched: **authorization**. The model stores §05 MITMs are anonymous public reads; but the
-usage data shows containers pulling from `registry.runpod.net`, which answers an anonymous
-manifest request with `401`. A cache that has terminated the client's TLS now holds a decrypted,
+touched: **authorization**. The model stores §05 MITMs are anonymous public reads; but the usage
+data shows containers pulling from `registry.runpod.net`, which answers
+an anonymous manifest request with `401`. A cache that has terminated the client's TLS now holds a decrypted,
 *unauthenticated* request for content it may already have on disk. It must not simply serve those
 bytes — that would turn the cache into an authorization bypass, handing any tenant another tenant's
 private images.
@@ -401,15 +413,21 @@ Two principles fall out, and they sharpen the rest of this document:
 
 ## What this would touch if it were ever built
 
-Pointers only — **none of this exists**:
+Already shipped (no longer in this list):
+
+- ✅ **per-SNI dynamic-cert logic** — [`mitm-minter.lua`](../nix/modules/mitm-minter.lua) +
+  [`nginx-client.nix`](../nix/modules/nginx-client.nix), tuned by `mitmMinter`
+  ([`nix/constants/security.nix`](../nix/constants/security.nix)), gated by `cache-mitm-test`.
+
+Still pointers only — **the rest does not exist**:
 
 - a `dstnat` block in [`network-setup.nix`](../nix/network-setup.nix) (today: masquerade only),
   gated on a named `@cdn_origins` interval set;
 - a standalone **IP-range updater daemon** feeding that set from published range feeds — itself a
   separate, failure-mode-heavy design (rate-cap, on-disk last-known-good fallback, validate/apply
   atomically), flagged above as a required follow-up;
-- per-SNI dynamic-cert logic in [`nginx-client.nix`](../nix/modules/nginx-client.nix) (or a new
-  module), plus an `ssl_preread` passthrough path;
+- an `ssl_preread` **stream-passthrough** path (the minter's no-SNI branch is the seam it attaches
+  to, but the `stream{}` block + SNI allowlist filter are not built);
 - a layer-injection alternative to [`ca-injector.nix`](../nix/modules/ca-injector.nix);
 - an `access_by_lua` delegated-auth gate on the serving path in
   [`nginx-cache.nix`](../nix/modules/nginx-cache.nix) (today: no authorization on cache reads),

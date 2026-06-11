@@ -54,16 +54,20 @@ if !hasSecrets then {
     let f = secretsDir + "/cache/ca/cache-CA.crt";
     in if builtins.pathExists f then f else null;
 
-  # ── Phase 3: per-client MITM CA + per-FQDN leaves (§14.2) ───────────
-  # Returns { ca; mitmDir; } for a client, or null until cache-gen-ca has
-  # minted that client's tree. `ca` is the per-client root (baked into the
-  # client's trust store + injected into containers); `mitmDir` holds the
-  # leaf <group>.{crt,key} that the client nginx loads per SNI server{}.
-  # Modules derive leaf filenames from constants.mitmCertGroups.
+  # ── Phase 3: per-client MITM CA + runtime SNI minter (§14.2/§14.6) ──
+  # Returns { ca; caKey; leafKey; mitmDir; } for a client, or null until
+  # cache-gen-ca has minted that client's tree. `ca` is the per-client root
+  # (baked into the client's trust store + injected into containers). `caKey`
+  # is the CA PRIVATE key and `leafKey` the single reused EC leaf key — both
+  # now installed on the box so the runtime minter can sign a leaf per SNI
+  # (online signer; per-client, never leaves the box). `mitmDir` holds any
+  # legacy pre-minted leaves (off by default).
   clientMitm = nodeName:
     let
       ca      = secretsDir + "/${nodeName}/ca/${nodeName}-CA.crt";
+      caKey   = secretsDir + "/${nodeName}/ca/${nodeName}-CA.key";
+      leafKey = secretsDir + "/${nodeName}/mitm/leaf.key";
       mitmDir = secretsDir + "/${nodeName}/mitm";
     in if builtins.pathExists ca
-       then { inherit ca mitmDir; } else null;
+       then { inherit ca caKey leafKey mitmDir; } else null;
 }

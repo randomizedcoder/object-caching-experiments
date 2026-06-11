@@ -136,8 +136,9 @@ while passive checks remain.
 
 **Transparent interception for *unmodified* containers.** A hard requirement is that an external
 user's Dockerfile and `docker pull` must work **as-is** — no edits. The lab achieves this with
-containerd `certs.d` `hosts.toml` routing, `/etc/hosts` redirection, a per-client MITM CA with
-per-FQDN leaf certs, and a runc CA-injector that bind-mounts trust into containers. Pulls and
+containerd `certs.d` `hosts.toml` routing, `/etc/hosts` redirection, a per-client MITM CA whose
+leaves are minted on the fly per SNI inside nginx, and a runc CA-injector that bind-mounts trust
+into containers. Pulls and
 in-build downloads transparently route through the cache without anyone changing their build.
 → [`05-trust-and-mitm.md`](docs/05-trust-and-mitm.md), [`03-client.md`](docs/03-client.md) §3.6.
 
